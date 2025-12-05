@@ -63,6 +63,19 @@ The simulation uses:
 - Console output: Number of layers, mode, calculated wait times, and fitted robot parameters (base time and factor for linear, or coefficients a,b,c,d for cubic, with a >= 0 constraint)
 - Plots: Temperature vs. time for all components, and wait time per layer with linear or cubic fit
 
+## Limitations
+
+This simulation provides a simplified thermal model for WAAM processes with several assumptions and constraints:
+
+- **1D Model**: The simulation uses a lumped capacitance approach with discrete nodes for the table, base plate, and layers. It does not account for spatial temperature gradients within each component, which may lead to inaccuracies in larger geometries.
+- **Simplified Heat Transfer**: Only conduction between components and radiation to the environment are modeled. Natural convection and forced cooling (e.g., fans) are neglected, potentially underestimating heat dissipation.
+- **Constant Material Properties**: Thermal conductivity and density are assumed constant, while only specific heat capacity varies with temperature (Maier-Kelley for WAAM wire and base plate). Real materials may have more complex dependencies.
+- **Fixed Time Steps**: The simulation uses a fixed time step (DT), which may not be optimal for all phases of the process. Adaptive time stepping could improve accuracy and efficiency.
+- **Idealized Geometry**: Contact areas and layer geometries are approximated. Real WAAM beads have variable cross-sections and may not perfectly match the modeled shapes.
+- **No Detailed Welding Physics**: The heat input during welding is simplified by instantly setting new layers to melting temperature. Actual arc physics, including energy deposition rates, are not modeled.
+
+**Conservative Interlayer Time Estimation**: Due to these simplifications, the calculated interlayer wait times tend to be overestimated. This conservative approach ensures that the simulated temperatures reach the target interlayer temperature safely, providing a safety margin in real-world applications where exact thermal conditions may vary.
+
 ## License
 
 This project is licensed under the terms specified in the LICENSE file.
