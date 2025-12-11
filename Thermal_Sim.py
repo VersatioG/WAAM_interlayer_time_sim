@@ -726,7 +726,7 @@ def run_simulation():
                             
                             logging_counter += 1
                             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+                                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
                 else:
                     # Bead-level: add whole bead
                     welding_node_idx = node_matrix.add_node(
@@ -746,7 +746,7 @@ def run_simulation():
                         
                         logging_counter += 1
                         if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                            log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+                            log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
         else:
             # Layer-level: add entire layer as single node
             layer_node_idx = node_matrix.add_node(
@@ -766,7 +766,7 @@ def run_simulation():
                 
                 logging_counter += 1
                 if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                    log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+                    log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
         
         # Cool until interpass temperature reached
         time_start_wait = current_time
@@ -795,7 +795,7 @@ def run_simulation():
             
             logging_counter += 1
             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
         
         wait_times.append(current_time - time_start_wait)
         
@@ -829,7 +829,7 @@ def run_simulation():
     
     return time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
 
-def log_data(t, node_matrix, t_log, layers_log, bp_log, table_log):
+def log_data(t, node_matrix, t_log, layers_log, bp_log, temp_table_log):
     """Log temperature data from NodeMatrix."""
     t_log.append(t)
     
@@ -844,7 +844,7 @@ def log_data(t, node_matrix, t_log, layers_log, bp_log, table_log):
     
     layers_log.append(layer_temps)
     bp_log.append(node_matrix.temperatures[node_matrix.bp_idx] if node_matrix.bp_idx is not None else AMBIENT_TEMP)
-    table_log.append(node_matrix.temperatures[node_matrix.table_idx] if node_matrix.table_idx is not None else AMBIENT_TEMP)
+    temp_table_log.append(node_matrix.temperatures[node_matrix.table_idx] if node_matrix.table_idx is not None else AMBIENT_TEMP)
 
 # =============================================================================
 # EVALUATION & PLOT
