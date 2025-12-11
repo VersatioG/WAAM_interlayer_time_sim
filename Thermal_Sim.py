@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import curve_fit
+from scipy.integrate import quad
 
 # =============================================================================
 # INPUT BLOCK (Adjust values here)
@@ -26,7 +27,9 @@ PROCESS_SPEED = 0.006        # [m/s] Welding speed (travel speed)
 MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
 INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
 MODE_1_WAIT_TIME = 30.0     # [s] Only for Mode 1: Forced pause after layer 1
-ARC_POWER = 2000.0          # [W] Arc power during welding
+ARC_POWER = 2500.0          # [W] Total arc power during welding
+WIRE_FEED_RATE = 0.05       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
+WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 
 # --- Robot Logic ---
 # Robot_Wait = Base_Time + (Layer_Index * Factor)  # Linear
@@ -42,7 +45,8 @@ CP_WAAM_C = -2.0e5
 CP_WAAM_LIQUID = 800.0     # [J/(kg K)] Constant capacity when molten
 RHO_WAAM = 7800.0          # [kg/m^3] Density
 LAMBDA_WAAM = 45.0         # [W/(m K)] Thermal conductivity
-EPSILON_WAAM = 0.75        # Emissivity
+EPSILON_WAAM = 0.6         # Emissivity (solid)
+EPSILON_WAAM_LIQUID = 0.3  # Emissivity (liquid/molten)
 
 # --- Geometry & Material: Base Plate ---
 BP_LENGTH = 0.15           # [m]
@@ -55,7 +59,7 @@ CP_BP_C = -2.0e5
 CP_BP_LIQUID = 800.0        # [J/(kg K)] Constant capacity when molten
 RHO_BP = 7850.0             # [kg/m^3]
 LAMBDA_BP = 45.0            # [W/(m K)]
-EPSILON_BP = 0.7            # Emissivity
+EPSILON_BP = 0.8            # Emissivity
 
 # --- Geometry & Material: Welding Table ---
 TABLE_LENGTH = 2.5         # [m]
@@ -64,7 +68,7 @@ TABLE_THICKNESS = 0.2      # [m]
 CP_TABLE = 460.0           # [J/(kg K)]
 RHO_TABLE = 7850.0         # [kg/m^3]
 LAMBDA_TABLE = 45.0        # [W/(m K)]
-EPSILON_TABLE = 0.6        # Emissivity
+EPSILON_TABLE = 0.7        # Emissivity
 
 # --- Interaction & Environment ---
 AMBIENT_TEMP = 25.0        # [°C]
@@ -103,8 +107,51 @@ def get_cp_bp(temp_c):
     cp = CP_BP_A + (CP_BP_B * tk) + (CP_BP_C * tk**-2)
     return cp
 
+def get_epsilon_waam(temp_c):
+    """
+    Returns the emissivity of WAAM material as a function of temperature.
+    Uses a step function with lower emissivity above melting temperature
+    (liquid metal has lower emissivity than oxidized solid).
+    """
+    if temp_c >= MELTING_TEMP:
+        return EPSILON_WAAM_LIQUID
+    return EPSILON_WAAM
+
 def kelvin(temp_c):
     return temp_c + 273.15
+
+def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, melting_temp, rho_wire):
+    """
+    Calculates the power required to heat and melt the wire from ambient to melting temperature.
+    Uses numerical integration of the temperature-dependent specific heat.
+    
+    Args:
+        wire_feed_rate: Wire feed rate [m/s]
+        wire_diameter: Wire diameter [m]
+        ambient_temp: Ambient temperature [°C]
+        melting_temp: Melting temperature [°C]
+        rho_wire: Wire density [kg/m³]
+    
+    Returns:
+        Power required to melt wire [W]
+    """
+    # Wire cross-sectional area
+    wire_area = np.pi * (wire_diameter / 2)**2  # [m²]
+    
+    # Mass flow rate of wire
+    mass_flow_rate = wire_area * wire_feed_rate * rho_wire  # [kg/s]
+    
+    # Function to integrate: cp as function of temperature in Celsius
+    def cp_integrand(temp_c):
+        return get_cp_waam(temp_c)  # [J/(kg K)]
+    
+    # Numerical integration of ∫cp dT from ambient_temp to melting_temp
+    energy_per_kg, _ = quad(cp_integrand, ambient_temp, melting_temp)  # [J/kg]
+    
+    # Power = mass_flow_rate * energy_per_kg
+    power_wire_melting = mass_flow_rate * energy_per_kg  # [W]
+    
+    return power_wire_melting
 
 # =============================================================================
 # SIMULATION
@@ -175,11 +222,25 @@ def run_simulation():
     
     current_time = 0.0
     
+    # Calculate power required to melt wire
+    power_wire_melting = calculate_wire_melting_power(
+        WIRE_FEED_RATE, WIRE_DIAMETER, AMBIENT_TEMP, MELTING_TEMP, RHO_WAAM
+    )
+    
+    # Effective arc power for heating beads (subtract wire melting power)
+    effective_arc_power = ARC_POWER - power_wire_melting
+    
+    if effective_arc_power < 0:
+        raise ValueError(f"Arc power ({ARC_POWER:.1f} W) is insufficient to melt wire. "
+                        f"Wire melting requires {power_wire_melting:.1f} W. "
+                        f"Increase ARC_POWER or reduce WIRE_FEED_RATE.")
+    
     print(f"Starting simulation (Mode {MODE})...")
     print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
     print(f"Layer duration: {layer_duration:.1f}s ({NUMBER_OF_TRACKS} tracks at {PROCESS_SPEED*1000:.1f}mm/s)")
     print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
     print(f"Bead-level simulation: Each layer is welded as {NUMBER_OF_TRACKS} individual beads")
+    print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
     
     # Bead geometry parameters bundled for passing to functions
     bead_params = {
@@ -248,7 +309,7 @@ def run_simulation():
             for _ in range(steps_bead):
                 combined_temps = update_temperatures_with_two_bead_layers(
                     combined_temps, m_table, m_bp, m_layer, layer_area, side_area_layer,
-                    num_base_nodes, len(prev_layer_beads), bead_params, is_welding=True, arc_power=ARC_POWER, current_bead_idx=i_bead
+                    num_base_nodes, len(prev_layer_beads), bead_params, is_welding=True, arc_power=effective_arc_power, current_bead_idx=i_bead
                 )
                 current_time += DT
                 
@@ -432,7 +493,8 @@ def update_temperatures_with_two_bead_layers(T, m_t, m_bp, m_l, layer_area, side
     
     # Consolidated layers radiation
     for i in range(2, num_base_nodes):
-        q_rad_layer = EPSILON_WAAM * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_layer = get_epsilon_waam(T[i])
+        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[i] -= q_rad_layer
     
     # Previous layer beads radiation
@@ -468,7 +530,8 @@ def update_temperatures_with_two_bead_layers(T, m_t, m_bp, m_l, layer_area, side
         
         # No top surface radiation (covered by current layer)
         
-        q_rad_bead = EPSILON_WAAM * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_bead = get_epsilon_waam(T[bead_idx])
+        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[bead_idx] -= q_rad_bead
     
     # Current layer beads radiation
@@ -505,7 +568,8 @@ def update_temperatures_with_two_bead_layers(T, m_t, m_bp, m_l, layer_area, side
             # Inner beads: only front and back
             rad_area += 2 * bead_width * LAYER_HEIGHT
         
-        q_rad_bead = EPSILON_WAAM * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_bead = get_epsilon_waam(T[bead_idx])
+        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[bead_idx] -= q_rad_bead
     
     # --- 2. Heat conduction ---
@@ -712,7 +776,8 @@ def update_temperatures_with_beads(T, m_t, m_bp, m_l, layer_area, side_area_laye
     
     # Consolidated layers radiation (side surfaces only, top is covered by beads/next layer)
     for i in range(2, num_base_nodes):
-        q_rad_layer = EPSILON_WAAM * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_layer = get_epsilon_waam(T[i])
+        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[i] -= q_rad_layer
     
     # Bead radiation (for single bead layer - top layer)
@@ -749,7 +814,8 @@ def update_temperatures_with_beads(T, m_t, m_bp, m_l, layer_area, side_area_laye
             # Inner beads: only front and back
             rad_area += 2 * bead_width * LAYER_HEIGHT
         
-        q_rad_bead = EPSILON_WAAM * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_bead = get_epsilon_waam(T[bead_idx])
+        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[bead_idx] -= q_rad_bead
     
     # --- 2. Heat conduction ---
@@ -890,7 +956,8 @@ def update_temperatures(T, m_t, m_bp, m_l, layer_area, side_area_layer):
         rad_area = side_area_layer
         if i == num_nodes - 1:  # Top layer
             rad_area += layer_area  # Add top surface area
-        q_rad_layer = EPSILON_WAAM * STEFAN_BOLTZMANN * rad_area * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
+        epsilon_layer = get_epsilon_waam(T[i])
+        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * rad_area * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
         Q_balance[i] -= q_rad_layer
 
     # --- 2. Heat conduction (conduction) ---
