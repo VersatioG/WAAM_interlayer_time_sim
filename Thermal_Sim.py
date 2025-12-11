@@ -12,6 +12,17 @@ from scipy.integrate import quad
 MODE = 2  # 1: Fixed wait time after 1st layer | 2: Always wait for temperature
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
 
+# --- Discretization Settings (counted from top) ---
+# NOTE: Element-level discretization increases computational cost significantly.
+# N_LAYERS_AS_BEADS: Top layers where each track is modeled as individual bead (thermal node)
+# N_LAYERS_WITH_ELEMENTS: Top layers where beads are further subdivided (finer resolution)
+# N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
+# Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
+# Element-level refinement is prepared but not yet fully implemented
+N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
+
 # --- WAAM Process Parameters ---
 NUMBER_OF_LAYERS = 30
 LAYER_HEIGHT = 0.0024       # [m] (e.g., 2.4mm)
@@ -120,6 +131,326 @@ def get_epsilon_waam(temp_c):
 def kelvin(temp_c):
     return temp_c + 273.15
 
+def get_cp_waam_vectorized(temps):
+    """Vectorized version of get_cp_waam for numpy arrays."""
+    temps = np.atleast_1d(temps)
+    result = np.zeros_like(temps, dtype=np.float64)
+    liquid_mask = temps >= MELTING_TEMP
+    solid_mask = ~liquid_mask
+    
+    result[liquid_mask] = CP_WAAM_LIQUID
+    if np.any(solid_mask):
+        tk = temps[solid_mask] + 273.15
+        result[solid_mask] = CP_WAAM_A + (CP_WAAM_B * tk) + (CP_WAAM_C * tk**-2)
+    return result
+
+def get_epsilon_waam_vectorized(temps):
+    """Vectorized version of get_epsilon_waam for numpy arrays."""
+    temps = np.atleast_1d(temps)
+    result = np.where(temps >= MELTING_TEMP, EPSILON_WAAM_LIQUID, EPSILON_WAAM)
+    return result
+
+# =============================================================================
+# EFFICIENT DATA STRUCTURES FOR SIMULATION
+# =============================================================================
+
+class ThermalModel:
+    """
+    Efficient thermal model using numpy arrays for simulation.
+    Stores geometry, mass, and area matrices for vectorized calculations.
+    """
+    
+    def __init__(self, layer_area, side_area_layer, bead_params):
+        """
+        Initialize thermal model with geometry parameters.
+        
+        Args:
+            layer_area: Top surface area of consolidated layer [m²]
+            side_area_layer: Side surface area of consolidated layer [m²]
+            bead_params: Dictionary with bead geometry parameters
+        """
+        self.layer_area = layer_area
+        self.side_area_layer = side_area_layer
+        self.bead_params = bead_params
+        
+        # Pre-compute table and base plate properties
+        vol_bp = BP_LENGTH * BP_WIDTH * BP_THICKNESS
+        self.m_bp = vol_bp * RHO_BP
+        vol_table = TABLE_LENGTH * TABLE_WIDTH * TABLE_THICKNESS
+        self.m_table = vol_table * RHO_TABLE
+        self.m_layer = layer_area * LAYER_HEIGHT * RHO_WAAM
+        
+        # Table effective radiation area
+        self.area_table_rad = (TABLE_LENGTH * TABLE_WIDTH) - CONTACT_BP_TABLE
+        
+        # Base plate total surface area
+        self.area_bp_total = 2 * (BP_LENGTH * BP_WIDTH + 
+                                   BP_LENGTH * BP_THICKNESS + 
+                                   BP_WIDTH * BP_THICKNESS)
+        
+        # Pre-computed bead masses (arrays for vectorized access)
+        m_first = bead_params['m_bead_first']
+        m_subsequent = bead_params['m_bead_subsequent']
+        
+        # Bead mass array for fast lookup
+        self.bead_masses = np.array([m_first] + [m_subsequent] * (NUMBER_OF_TRACKS - 1))
+        
+        # Bead areas
+        self.bead_areas = np.array([bead_params['bead_area_first']] + 
+                                    [bead_params['bead_area_subsequent']] * (NUMBER_OF_TRACKS - 1))
+        
+        # Bead widths for radiation
+        self.bead_widths = np.array([TRACK_WIDTH] + 
+                                     [TRACK_WIDTH * (1 - TRACK_OVERLAP)] * (NUMBER_OF_TRACKS - 1))
+        
+        # Pre-compute radiation areas for all possible bead configurations
+        # Cache for different num_beads and is_top_layer combinations
+        self._rad_area_cache = {}
+        for num_beads in range(1, NUMBER_OF_TRACKS + 1):
+            self._rad_area_cache[(num_beads, True)] = self._compute_bead_rad_areas(num_beads, True)
+            self._rad_area_cache[(num_beads, False)] = self._compute_bead_rad_areas(num_beads, False)
+    
+    def _compute_bead_rad_areas(self, num_beads, is_top_layer):
+        """Internal method to compute radiation areas (called during initialization)."""
+        rad_areas = np.zeros(num_beads, dtype=np.float64)
+        
+        for i_bead in range(num_beads):
+            bead_width = self.bead_widths[i_bead] if i_bead < len(self.bead_widths) else self.bead_widths[-1]
+            bead_top = self.bead_areas[i_bead] if i_bead < len(self.bead_areas) else self.bead_areas[-1]
+            
+            rad_area = bead_top if is_top_layer else 0.0
+            
+            if num_beads == 1:
+                rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
+            elif i_bead == 0:
+                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
+            elif i_bead == num_beads - 1:
+                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
+            else:
+                rad_area += 2 * bead_width * LAYER_HEIGHT
+            
+            rad_areas[i_bead] = rad_area
+        
+        return rad_areas
+    
+    def compute_bead_radiation_areas(self, num_beads, is_top_layer=True):
+        """
+        Get cached radiation areas for beads in a layer.
+        Uses pre-computed cache for O(1) lookup.
+        
+        Args:
+            num_beads: Number of beads currently in layer
+            is_top_layer: Whether this is the top layer (affects top surface radiation)
+        
+        Returns:
+            numpy array of radiation areas for each bead
+        """
+        if num_beads == 0:
+            return np.array([], dtype=np.float64)
+        
+        # Use cache if available
+        key = (num_beads, is_top_layer)
+        if key in self._rad_area_cache:
+            return self._rad_area_cache[key]
+        
+        # Fallback to calculation if not in cache
+        return self._compute_bead_rad_areas(num_beads, is_top_layer)
+
+
+def update_temperatures_vectorized(T_array, model, num_base_nodes, num_prev_beads, 
+                                    is_welding=False, arc_power=0.0, current_bead_idx=0):
+    """
+    Efficient temperature update using numpy operations.
+    
+    Args:
+        T_array: numpy array of current temperatures
+        model: ThermalModel instance with precomputed geometry
+        num_base_nodes: Number of base nodes (table + bp + consolidated layers)
+        num_prev_beads: Number of beads in previous layer
+        is_welding: Whether arc power is active
+        arc_power: Effective arc power [W]
+        current_bead_idx: Index of bead being welded
+    
+    Returns:
+        numpy array of updated temperatures
+    """
+    num_nodes = len(T_array)
+    num_current_beads = num_nodes - num_base_nodes - num_prev_beads
+    
+    # Initialize heat balance array
+    Q_balance = np.zeros(num_nodes, dtype=np.float64)
+    
+    # --- Arc power during welding ---
+    if is_welding and arc_power > 0:
+        current_bead_node = num_base_nodes + num_prev_beads + current_bead_idx
+        
+        if current_bead_idx > 0:
+            # Has previous bead: 50% current, 25% previous, 25% below
+            Q_balance[current_bead_node] += 0.5 * arc_power
+            prev_bead_node = current_bead_node - 1
+            Q_balance[prev_bead_node] += 0.25 * arc_power
+            if num_prev_beads > 0:
+                bead_below = num_base_nodes + current_bead_idx
+                Q_balance[bead_below] += 0.25 * arc_power
+            else:
+                Q_balance[1] += 0.25 * arc_power  # Baseplate
+        else:
+            # No previous bead: 75% current, 25% below
+            Q_balance[current_bead_node] += 0.75 * arc_power
+            if num_prev_beads > 0:
+                bead_below = num_base_nodes + current_bead_idx
+                Q_balance[bead_below] += 0.25 * arc_power
+            else:
+                Q_balance[1] += 0.25 * arc_power
+    
+    # --- Radiation ---
+    T_K4 = (T_array + 273.15)**4
+    T_amb_K4 = (AMBIENT_TEMP + 273.15)**4
+    
+    # Table radiation
+    Q_balance[0] -= EPSILON_TABLE * STEFAN_BOLTZMANN * model.area_table_rad * (T_K4[0] - T_amb_K4)
+    
+    # Base plate radiation
+    num_consolidated = num_base_nodes - 2
+    total_bead_area = 0.0
+    if num_prev_beads > 0:
+        total_bead_area += np.sum(model.bead_areas[:num_prev_beads])
+    if num_current_beads > 0:
+        total_bead_area += np.sum(model.bead_areas[:num_current_beads])
+    covered_area = num_consolidated * model.layer_area + total_bead_area
+    eff_bp_area = max(0, model.area_bp_total - covered_area)
+    Q_balance[1] -= EPSILON_BP * STEFAN_BOLTZMANN * eff_bp_area * (T_K4[1] - T_amb_K4)
+    
+    # Consolidated layers radiation (vectorized)
+    if num_consolidated > 0:
+        layer_indices = np.arange(2, num_base_nodes)
+        epsilon_layers = get_epsilon_waam_vectorized(T_array[layer_indices])
+        Q_balance[layer_indices] -= epsilon_layers * STEFAN_BOLTZMANN * model.side_area_layer * (T_K4[layer_indices] - T_amb_K4)
+    
+    # Previous layer beads radiation
+    if num_prev_beads > 0:
+        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
+        prev_rad_areas = model.compute_bead_radiation_areas(num_prev_beads, is_top_layer=False)
+        epsilon_prev = get_epsilon_waam_vectorized(T_array[prev_indices])
+        Q_balance[prev_indices] -= epsilon_prev * STEFAN_BOLTZMANN * prev_rad_areas * (T_K4[prev_indices] - T_amb_K4)
+    
+    # Current layer beads radiation
+    if num_current_beads > 0:
+        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_nodes)
+        curr_rad_areas = model.compute_bead_radiation_areas(num_current_beads, is_top_layer=True)
+        epsilon_curr = get_epsilon_waam_vectorized(T_array[curr_indices])
+        Q_balance[curr_indices] -= epsilon_curr * STEFAN_BOLTZMANN * curr_rad_areas * (T_K4[curr_indices] - T_amb_K4)
+    
+    # --- Conduction ---
+    # Table <-> Base plate
+    q_contact = ALPHA_CONTACT * CONTACT_BP_TABLE * (T_array[1] - T_array[0])
+    Q_balance[0] += q_contact
+    Q_balance[1] -= q_contact
+    
+    # Base plate <-> first layer (or first beads)
+    if num_consolidated > 0:
+        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
+        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
+        q_cond = lam_eff * model.layer_area / dist * (T_array[2] - T_array[1])
+        Q_balance[1] += q_cond
+        Q_balance[2] -= q_cond
+        
+        # Between consolidated layers (vectorized)
+        if num_consolidated > 1:
+            for i in range(2, num_base_nodes - 1):
+                q_layer = LAMBDA_WAAM * model.layer_area / LAYER_HEIGHT * (T_array[i+1] - T_array[i])
+                Q_balance[i] += q_layer
+                Q_balance[i+1] -= q_layer
+    
+    # Conduction between beads (horizontal) - previous layer
+    if num_prev_beads > 1:
+        overlap_width = model.bead_params['overlap_width']
+        contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
+        for i_bead in range(num_prev_beads - 1):
+            idx = num_base_nodes + i_bead
+            q_horiz = LAMBDA_WAAM * contact_area / overlap_width * (T_array[idx+1] - T_array[idx])
+            Q_balance[idx] += q_horiz
+            Q_balance[idx+1] -= q_horiz
+    
+    # Conduction between beads (horizontal) - current layer
+    if num_current_beads > 1:
+        overlap_width = model.bead_params['overlap_width']
+        contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
+        for i_bead in range(num_current_beads - 1):
+            idx = num_base_nodes + num_prev_beads + i_bead
+            q_horiz = LAMBDA_WAAM * contact_area / overlap_width * (T_array[idx+1] - T_array[idx])
+            Q_balance[idx] += q_horiz
+            Q_balance[idx+1] -= q_horiz
+    
+    # Vertical conduction: consolidated -> prev beads, prev beads -> current beads
+    if num_prev_beads > 0:
+        # Consolidated or BP -> prev beads
+        dist = LAYER_HEIGHT if num_consolidated > 0 else (BP_THICKNESS / 2 + LAYER_HEIGHT / 2)
+        lam = LAMBDA_WAAM if num_consolidated > 0 else (LAMBDA_BP + LAMBDA_WAAM) / 2
+        base_idx = num_base_nodes - 1 if num_consolidated > 0 else 1
+        
+        for i_bead in range(num_prev_beads):
+            bead_idx = num_base_nodes + i_bead
+            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
+            q_vert = lam * area / dist * (T_array[bead_idx] - T_array[base_idx])
+            Q_balance[base_idx] += q_vert
+            Q_balance[bead_idx] -= q_vert
+    
+    # Prev beads -> current beads (vertical)
+    if num_prev_beads > 0 and num_current_beads > 0:
+        for i_bead in range(num_current_beads):
+            curr_idx = num_base_nodes + num_prev_beads + i_bead
+            prev_idx = num_base_nodes + i_bead
+            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
+            q_vert = LAMBDA_WAAM * area / LAYER_HEIGHT * (T_array[curr_idx] - T_array[prev_idx])
+            Q_balance[prev_idx] += q_vert
+            Q_balance[curr_idx] -= q_vert
+    elif num_current_beads > 0:
+        # Current beads directly on consolidated layer or BP
+        dist = LAYER_HEIGHT if num_consolidated > 0 else (BP_THICKNESS / 2 + LAYER_HEIGHT / 2)
+        lam = LAMBDA_WAAM if num_consolidated > 0 else (LAMBDA_BP + LAMBDA_WAAM) / 2
+        base_idx = num_base_nodes - 1 if num_consolidated > 0 else 1
+        
+        for i_bead in range(num_current_beads):
+            curr_idx = num_base_nodes + num_prev_beads + i_bead
+            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
+            q_vert = lam * area / dist * (T_array[curr_idx] - T_array[base_idx])
+            Q_balance[base_idx] += q_vert
+            Q_balance[curr_idx] -= q_vert
+    
+    # --- Temperature update (Euler explicit) ---
+    new_T = T_array.copy()
+    
+    # Table
+    new_T[0] += (Q_balance[0] * DT) / (model.m_table * CP_TABLE)
+    
+    # Base plate
+    cp_bp = get_cp_bp(T_array[1])
+    new_T[1] += (Q_balance[1] * DT) / (model.m_bp * cp_bp)
+    
+    # Consolidated layers (vectorized)
+    if num_consolidated > 0:
+        layer_indices = np.arange(2, num_base_nodes)
+        cp_layers = get_cp_waam_vectorized(T_array[layer_indices])
+        new_T[layer_indices] += (Q_balance[layer_indices] * DT) / (model.m_layer * cp_layers)
+    
+    # Previous layer beads
+    if num_prev_beads > 0:
+        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
+        cp_prev = get_cp_waam_vectorized(T_array[prev_indices])
+        masses_prev = model.bead_masses[:num_prev_beads]
+        new_T[prev_indices] += (Q_balance[prev_indices] * DT) / (masses_prev * cp_prev)
+    
+    # Current layer beads
+    if num_current_beads > 0:
+        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_nodes)
+        cp_curr = get_cp_waam_vectorized(T_array[curr_indices])
+        masses_curr = model.bead_masses[:num_current_beads]
+        new_T[curr_indices] += (Q_balance[curr_indices] * DT) / (masses_curr * cp_curr)
+    
+    return new_T
+
+
 def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, melting_temp, rho_wire):
     """
     Calculates the power required to heat and melt the wire from ambient to melting temperature.
@@ -158,91 +489,66 @@ def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, me
 # =============================================================================
 
 def run_simulation():
-    # Calculate effective layer geometry
-    # Effective width considering overlap: W_eff = W_track * N - W_track * (N-1) * overlap%
-    effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1-TRACK_OVERLAP)
-    layer_area = effective_layer_width * TRACK_LENGTH  # Top surface area of one layer
-    layer_volume = layer_area * LAYER_HEIGHT
+    """
+    Main simulation function using efficient numpy arrays.
+    Uses ThermalModel class for precomputed geometry parameters.
+    """
+    # --- Input validation ---
+    if N_LAYERS_AS_BEADS > NUMBER_OF_LAYERS:
+        raise ValueError(f"N_LAYERS_AS_BEADS ({N_LAYERS_AS_BEADS}) must be <= NUMBER_OF_LAYERS ({NUMBER_OF_LAYERS})")
     
-    # Calculate side area for layer radiation (mantle surface)
-    # 2 * (length * height + width * height) = 2 * (L*H + W*H)
+    if N_LAYERS_WITH_ELEMENTS > N_LAYERS_AS_BEADS:
+        raise ValueError(f"N_LAYERS_WITH_ELEMENTS ({N_LAYERS_WITH_ELEMENTS}) must be <= N_LAYERS_AS_BEADS ({N_LAYERS_AS_BEADS})")
+    
+    if N_ELEMENTS_PER_BEAD <= 0:
+        raise ValueError(f"N_ELEMENTS_PER_BEAD ({N_ELEMENTS_PER_BEAD}) must be > 0")
+    
+    if DT <= 0:
+        raise ValueError(f"DT ({DT}) must be > 0")
+    
+    # Check DT stability (rough estimate based on thermal diffusivity)
+    # Thermal diffusivity alpha = lambda / (rho * cp) ≈ 4e-6 m²/s for steel
+    alpha = LAMBDA_WAAM / (RHO_WAAM * CP_WAAM_A)  # Approximate using solid cp
+    dx_min = min(LAYER_HEIGHT, TRACK_WIDTH / max(N_ELEMENTS_PER_BEAD, 1))
+    dt_max_stable = dx_min**2 / (2 * alpha)
+    if DT > dt_max_stable:
+        print(f"Warning: DT ({DT:.3f}s) may be too large for stability. Recommended max: {dt_max_stable:.3f}s")
+        print("Consider reducing DT for better accuracy and stability.")
+    
+    # Calculate effective layer geometry
+    effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
+    layer_area = effective_layer_width * TRACK_LENGTH
+    layer_volume = layer_area * LAYER_HEIGHT
     side_area_layer = 2 * (TRACK_LENGTH * LAYER_HEIGHT + effective_layer_width * LAYER_HEIGHT)
     
-    # Calculate layer duration based on process speed
-    # Total distance = number of tracks * track length (assuming sequential welding)
+    # Calculate layer duration
     total_weld_distance = NUMBER_OF_TRACKS * TRACK_LENGTH
-    layer_duration = total_weld_distance / PROCESS_SPEED  # [s]
+    layer_duration = total_weld_distance / PROCESS_SPEED
     
-    # --- Bead (track) geometry for detailed top layer simulation ---
-    # Each bead has its own geometry
-    # Effective bead width considering overlap with previous bead
-    bead_width_effective = TRACK_WIDTH * (1 - TRACK_OVERLAP)  # Effective new width per bead
-    # First bead has full width, subsequent beads have reduced effective width
-    bead_area_first = TRACK_WIDTH * TRACK_LENGTH  # First bead full area
-    bead_area_subsequent = bead_width_effective * TRACK_LENGTH  # Subsequent beads
+    # --- Bead geometry ---
+    bead_width_effective = TRACK_WIDTH * (1 - TRACK_OVERLAP)
+    bead_area_first = TRACK_WIDTH * TRACK_LENGTH
+    bead_area_subsequent = bead_width_effective * TRACK_LENGTH
     bead_volume_first = bead_area_first * LAYER_HEIGHT
     bead_volume_subsequent = bead_area_subsequent * LAYER_HEIGHT
     m_bead_first = bead_volume_first * RHO_WAAM
     m_bead_subsequent = bead_volume_subsequent * RHO_WAAM
     
-    # Side area for bead radiation
-    # 2 * (length * height) for front/back + 2 * (width * height) for sides
-    # But adjacent beads share sides, so we use outer sides only
     side_area_bead_first = 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * TRACK_WIDTH * LAYER_HEIGHT
     side_area_bead_subsequent = 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width_effective * LAYER_HEIGHT
     
-    # Contact area between adjacent beads (overlap zone)
     overlap_width = TRACK_WIDTH * TRACK_OVERLAP
-    bead_contact_area = overlap_width * TRACK_LENGTH * LAYER_HEIGHT / LAYER_HEIGHT  # Just overlap * length
-    bead_contact_area = overlap_width * TRACK_LENGTH  # Contact area in length direction
-    
-    # Duration per bead
-    bead_duration = TRACK_LENGTH / PROCESS_SPEED  # [s]
+    bead_contact_area = overlap_width * TRACK_LENGTH
+    bead_duration = TRACK_LENGTH / PROCESS_SPEED
     
     # Initialize masses
     vol_bp = BP_LENGTH * BP_WIDTH * BP_THICKNESS
     m_bp = vol_bp * RHO_BP
-    
     vol_table = TABLE_LENGTH * TABLE_WIDTH * TABLE_THICKNESS
     m_table = vol_table * RHO_TABLE
-    
     m_layer = layer_volume * RHO_WAAM
     
-    # Temperature arrays (start at ambient temp)
-    # nodes[0] = table, nodes[1] = base plate, nodes[2...] = individual layers
-    temps = [AMBIENT_TEMP, AMBIENT_TEMP] 
-    
-    # Result storage - store temperature of each layer over time
-    time_log = []
-    temp_layers_log = []  # Will store list of all layer temps at each time step
-    temp_bp_log = []
-    temp_table_log = []
-    
-    wait_times = [] # Actual required wait times per layer
-    
-    current_time = 0.0
-    
-    # Calculate power required to melt wire
-    power_wire_melting = calculate_wire_melting_power(
-        WIRE_FEED_RATE, WIRE_DIAMETER, AMBIENT_TEMP, MELTING_TEMP, RHO_WAAM
-    )
-    
-    # Effective arc power for heating beads (subtract wire melting power)
-    effective_arc_power = ARC_POWER - power_wire_melting
-    
-    if effective_arc_power < 0:
-        raise ValueError(f"Arc power ({ARC_POWER:.1f} W) is insufficient to melt wire. "
-                        f"Wire melting requires {power_wire_melting:.1f} W. "
-                        f"Increase ARC_POWER or reduce WIRE_FEED_RATE.")
-    
-    print(f"Starting simulation (Mode {MODE})...")
-    print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
-    print(f"Layer duration: {layer_duration:.1f}s ({NUMBER_OF_TRACKS} tracks at {PROCESS_SPEED*1000:.1f}mm/s)")
-    print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
-    print(f"Bead-level simulation: Each layer is welded as {NUMBER_OF_TRACKS} individual beads")
-    print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
-    
-    # Bead geometry parameters bundled for passing to functions
+    # Bead parameters dictionary
     bead_params = {
         'bead_area_first': bead_area_first,
         'bead_area_subsequent': bead_area_subsequent,
@@ -255,151 +561,140 @@ def run_simulation():
         'overlap_width': overlap_width
     }
     
-    # Loop over all layers
+    # Create thermal model for efficient calculations
+    thermal_model = ThermalModel(layer_area, side_area_layer, bead_params)
+    
+    # Temperature array (start at ambient) - using numpy for efficiency
+    temps = np.array([AMBIENT_TEMP, AMBIENT_TEMP], dtype=np.float64)
+    
+    # Result storage
+    time_log = []
+    temp_layers_log = []
+    temp_bp_log = []
+    temp_table_log = []
+    wait_times = []
+    
+    current_time = 0.0
+    
+    # Calculate wire melting power
+    power_wire_melting = calculate_wire_melting_power(
+        WIRE_FEED_RATE, WIRE_DIAMETER, AMBIENT_TEMP, MELTING_TEMP, RHO_WAAM
+    )
+    effective_arc_power = ARC_POWER - power_wire_melting
+    
+    if effective_arc_power < 0:
+        raise ValueError(f"Arc power ({ARC_POWER:.1f} W) insufficient to melt wire. "
+                        f"Wire melting requires {power_wire_melting:.1f} W.")
+    
+    print(f"Starting simulation (Mode {MODE})...")
+    print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
+    print(f"Layer duration: {layer_duration:.1f}s ({NUMBER_OF_TRACKS} tracks at {PROCESS_SPEED*1000:.1f}mm/s)")
+    print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
+    print(f"Discretization: {N_LAYERS_AS_BEADS} top layers as beads, {N_LAYERS_WITH_ELEMENTS} with elements ({N_ELEMENTS_PER_BEAD}/bead)")
+    print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
+    
+    # Main simulation loop
     for i_layer in tqdm(range(NUMBER_OF_LAYERS)):
         
-        # --- Bead-by-bead welding process for current layer ---
-        # For improved realism: Expand top 2 layers as beads (current + previous)
-        # This allows modeling remelting in overlap zones
-        
-        # Determine structure:
-        # - If i_layer == 0: Only current layer as beads
-        # - If i_layer >= 1: Previous layer also as beads, older layers consolidated
-        
+        # Determine structure based on layer position
         if i_layer == 0:
             # First layer: [table, bp] + current_beads
-            base_temps = temps[:]  # [table, bp]
+            base_temps = temps.copy()
             num_base_nodes = len(base_temps)
-            prev_layer_beads = []  # No previous layer
-            current_layer_beads = []
+            prev_layer_beads = np.array([], dtype=np.float64)
+            current_layer_beads = np.array([], dtype=np.float64)
         else:
-            # Subsequent layers: Expand previous layer (last consolidated node) back to beads
-            # Assume previous layer was merged with uniform temperature
-            # Re-expand to beads with same temperature
-            base_temps = temps[:-1]  # All except last layer
+            # Subsequent layers: Expand previous layer to beads
+            base_temps = temps[:-1].copy()
             num_base_nodes = len(base_temps)
             prev_layer_temp = temps[-1]
-            
-            # Re-create previous layer as beads
-            prev_layer_beads = [prev_layer_temp] * NUMBER_OF_TRACKS
-            current_layer_beads = []
+            prev_layer_beads = np.full(NUMBER_OF_TRACKS, prev_layer_temp, dtype=np.float64)
+            current_layer_beads = np.array([], dtype=np.float64)
         
         # 1. Weld each bead sequentially
         for i_bead in range(NUMBER_OF_TRACKS):
             # Add new bead at melting temperature
-            current_layer_beads.append(MELTING_TEMP)
+            current_layer_beads = np.append(current_layer_beads, MELTING_TEMP)
             
-            # Create combined temp array for simulation step
-            # [table, bp, consolidated_layers..., prev_layer_beads..., current_layer_beads...]
-            combined_temps = base_temps + prev_layer_beads + current_layer_beads
-            
-            # Determine bead properties for current bead
-            if i_bead == 0:
-                m_bead = m_bead_first
-                bead_area = bead_area_first
-                side_area_bead = side_area_bead_first
-            else:
-                m_bead = m_bead_subsequent
-                bead_area = bead_area_subsequent
-                side_area_bead = side_area_bead_subsequent
+            # Create combined temperature array
+            combined_temps = np.concatenate([base_temps, prev_layer_beads, current_layer_beads])
             
             # Simulate welding of this bead
             steps_bead = int(bead_duration / DT)
             
             for _ in range(steps_bead):
-                combined_temps = update_temperatures_with_two_bead_layers(
-                    combined_temps, m_table, m_bp, m_layer, layer_area, side_area_layer,
-                    num_base_nodes, len(prev_layer_beads), bead_params, is_welding=True, arc_power=effective_arc_power, current_bead_idx=i_bead
+                combined_temps = update_temperatures_vectorized(
+                    combined_temps, thermal_model, num_base_nodes, 
+                    len(prev_layer_beads), is_welding=True, 
+                    arc_power=effective_arc_power, current_bead_idx=i_bead
                 )
                 current_time += DT
                 
-                # Log data - use hottest bead as representative
-                log_temps = base_temps[:2] + base_temps[2:]  # table, bp, consolidated layers
-                
-                # Add previous layer (if exists) as one node (max temp of prev beads)
-                if prev_layer_beads:
-                    num_prev_beads = len(prev_layer_beads)
-                    max_prev_temp = max(combined_temps[num_base_nodes:num_base_nodes+num_prev_beads])
-                    log_temps.append(max_prev_temp)
-                
-                # Add current layer (max temp of current beads)
-                if current_layer_beads:
-                    num_prev_beads = len(prev_layer_beads)
-                    max_current_temp = max(combined_temps[num_base_nodes+num_prev_beads:])
-                    log_temps.append(max_current_temp)
-                
+                # Log data
+                num_prev = len(prev_layer_beads)
+                log_temps = list(combined_temps[:num_base_nodes])
+                if num_prev > 0:
+                    log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
+                if len(current_layer_beads) > 0:
+                    log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
                 log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
             
-            # Update bead temps from combined
-            num_prev_beads = len(prev_layer_beads)
-            if num_prev_beads > 0:
-                prev_layer_beads = list(combined_temps[num_base_nodes:num_base_nodes+num_prev_beads])
-            current_layer_beads = list(combined_temps[num_base_nodes+num_prev_beads:])
-            # Update base temps
-            base_temps = list(combined_temps[:num_base_nodes])
+            # Update arrays from combined
+            num_prev = len(prev_layer_beads)
+            if num_prev > 0:
+                prev_layer_beads = combined_temps[num_base_nodes:num_base_nodes + num_prev].copy()
+            current_layer_beads = combined_temps[num_base_nodes + num_prev:].copy()
+            base_temps = combined_temps[:num_base_nodes].copy()
         
-        # 2. After all beads welded, continue cooling until interpass temp reached
+        # 2. Cool until interpass temperature reached
         time_start_wait = current_time
-        combined_temps = base_temps + prev_layer_beads + current_layer_beads
+        combined_temps = np.concatenate([base_temps, prev_layer_beads, current_layer_beads])
         
         while True:
-            # Check condition on hottest bead in current layer
-            num_prev_beads = len(prev_layer_beads)
-            current_beads_temps = combined_temps[num_base_nodes+num_prev_beads:]
-            t_hottest_bead = max(current_beads_temps) if current_beads_temps else AMBIENT_TEMP
+            num_prev = len(prev_layer_beads)
+            current_beads_temps = combined_temps[num_base_nodes + num_prev:]
+            t_hottest_bead = np.max(current_beads_temps) if len(current_beads_temps) > 0 else AMBIENT_TEMP
             
             condition_met = t_hottest_bead <= INTERLAYER_TEMP
             
-            # Special case Mode 1: First pause fixed
+            # Mode 1 special case
             if MODE == 1 and i_layer == 0:
-                elapsed_wait = current_time - time_start_wait
-                if elapsed_wait >= MODE_1_WAIT_TIME:
+                if current_time - time_start_wait >= MODE_1_WAIT_TIME:
                     break
-            else:
-                if condition_met:
-                    break
+            elif condition_met:
+                break
             
-            # Compute step with beads
-            combined_temps = update_temperatures_with_two_bead_layers(
-                combined_temps, m_table, m_bp, m_layer, layer_area, side_area_layer,
-                num_base_nodes, len(prev_layer_beads), bead_params, is_welding=False
+            combined_temps = update_temperatures_vectorized(
+                combined_temps, thermal_model, num_base_nodes,
+                len(prev_layer_beads), is_welding=False
             )
             current_time += DT
             
             # Log
             log_temps = list(combined_temps[:num_base_nodes])
-            if prev_layer_beads:
-                max_prev_temp = max(combined_temps[num_base_nodes:num_base_nodes+num_prev_beads])
-                log_temps.append(max_prev_temp)
-            if current_layer_beads:
-                max_current_temp = max(combined_temps[num_base_nodes+num_prev_beads:])
-                log_temps.append(max_current_temp)
+            if num_prev > 0:
+                log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
+            log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
             log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
             
             # Update
-            if num_prev_beads > 0:
-                prev_layer_beads = list(combined_temps[num_base_nodes:num_base_nodes+num_prev_beads])
-            current_layer_beads = list(combined_temps[num_base_nodes+num_prev_beads:])
-            base_temps = list(combined_temps[:num_base_nodes])
+            if num_prev > 0:
+                prev_layer_beads = combined_temps[num_base_nodes:num_base_nodes + num_prev].copy()
+            current_layer_beads = combined_temps[num_base_nodes + num_prev:].copy()
+            base_temps = combined_temps[:num_base_nodes].copy()
         
-        # 3. Merge current layer beads back into single node
+        # 3. Merge beads back to single node (mass-weighted average)
         total_bead_mass = m_bead_first + (NUMBER_OF_TRACKS - 1) * m_bead_subsequent
-        weighted_temp = (current_layer_beads[0] * m_bead_first + 
-                        sum(current_layer_beads[1:]) * m_bead_subsequent) / total_bead_mass
+        bead_masses = np.array([m_bead_first] + [m_bead_subsequent] * (NUMBER_OF_TRACKS - 1))
+        weighted_temp = np.sum(current_layer_beads * bead_masses[:len(current_layer_beads)]) / total_bead_mass
         
-        # If previous layer exists as beads, also merge it
         if len(prev_layer_beads) > 0:
-            weighted_prev_temp = (prev_layer_beads[0] * m_bead_first + 
-                                 sum(prev_layer_beads[1:]) * m_bead_subsequent) / total_bead_mass
-            # Update temps: base + merged_prev + merged_current
-            temps = base_temps + [weighted_prev_temp, weighted_temp]
+            weighted_prev_temp = np.sum(prev_layer_beads * bead_masses[:len(prev_layer_beads)]) / total_bead_mass
+            temps = np.append(base_temps, [weighted_prev_temp, weighted_temp])
         else:
-            # First layer: only current
-            temps = base_temps + [weighted_temp]
+            temps = np.append(base_temps, weighted_temp)
         
-        # Store wait time
-        actual_wait = current_time - time_start_wait
-        wait_times.append(actual_wait)
+        wait_times.append(current_time - time_start_wait)
 
     return time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
 

@@ -1,17 +1,20 @@
 # WAAM Interlayer Time Simulation
 
-This project simulates the thermal behavior during Wire Arc Additive Manufacturing (WAAM) processes. It models temperature evolution in a welding table, base plate, and deposited layers, focusing on interlayer cooling times to optimize manufacturing parameters.
+This project simulates the thermal behavior during Wire Arc Additive Manufacturing (WAAM) processes. WAAM is a metal additive manufacturing technique that builds parts layer-by-layer using an electric arc to melt metal wire, depositing it as weld beads. The simulation focuses on interlayer cooling times—the waiting periods between layer depositions—to optimize manufacturing parameters and prevent defects like distortion or poor bonding.
+
+The code models temperature evolution in the welding setup (table, base plate, and deposited layers) using finite difference methods. It accounts for heat input from the welding arc, heat conduction between components, and radiation to the environment. The top layers are modeled at bead-level (individual weld tracks) for accuracy, while older layers are consolidated for efficiency.
 
 ## Features
 
 - **Thermal Simulation**: Finite difference methods with Euler explicit time-stepping
 - **Two Simulation Modes**: Fixed wait time after first layer or dynamic waiting until target interlayer temperature
 - **Detailed Heat Transfer**: Conduction between components, radiation to environment, and arc power input during welding
-- **Bead-Level Modeling**: Individual weld tracks (beads) are simulated for the top two layers, accounting for sequential deposition and arc power distribution
+- **Bead-Level Modeling**: Individual weld tracks (beads) are simulated for the top layers, accounting for sequential deposition and arc power distribution
 - **Arc Power Distribution**: Configurable heat input during welding, distributed to current bead (50-75%), adjacent beads, and underlying components
 - **Temperature-Dependent Properties**: Maier-Kelley equation for specific heat of WAAM wire and base plate
 - **Flexible Robot Parameter Fitting**: Linear or cubic fitting of interlayer wait times with non-negative constraints
 - **Comprehensive Visualization**: Temperature profiles and wait time analysis with fitting curves
+- **Efficient Data Structures**: Numpy-based arrays for fast computation, with prepared element-level discretization for finer resolution
 
 ## Installation
 
@@ -38,95 +41,87 @@ python Thermal_Sim.py
 
 The script will:
 
-1. Run the thermal simulation based on the configured parameters
-2. Display results in the console, including fitted robot parameters
-3. Generate plots showing temperature profiles and wait times
+1. Validate input parameters (e.g., discretization settings, time step stability)
+2. Run the thermal simulation based on the configured parameters
+3. Display results in the console, including fitted robot parameters
+4. Generate plots showing temperature profiles and wait times
 
 ### Configuration
 
 Modify the input parameters at the top of `Thermal_Sim.py` to adjust:
 
-- **Simulation settings**: Mode (fixed/dynamic wait), time step (DT)
-- **WAAM process parameters**: Number of layers, layer height, track geometry (width, overlap, number of tracks, length), process speed, temperatures (melting, interlayer), arc power
+- **Simulation settings**: Mode (fixed/dynamic wait), time step (DT), discretization levels
+- **WAAM process parameters**: Number of layers, layer height, track geometry (width, overlap, number of tracks, length), process speed, temperatures (melting, interlayer), arc power, wire feed rate
 - **Material properties**: Maier-Kelley coefficients, thermal conductivities, densities, emissivities for WAAM wire, base plate, and table
 - **Geometry**: Dimensions of base plate, table, and contact areas
 - **Robot fitting mode**: Choose between "linear" or "cubic" for interlayer wait time approximation (with non-negative constraints)
 
-## Detailed Functionality
+## How the Simulation Works
 
-### Simulation Overview
+### Physical Model
 
-The code implements a thermal finite difference simulation for WAAM processes. It models heat transfer through conduction, radiation, and arc power input during welding. The simulation tracks temperatures of the welding table, base plate, and deposited layers over time.
+The simulation solves the heat equation using finite differences in a quasi-2D/3D setup:
 
-### Key Components
+- **Components**: Welding table (bottom), base plate, and deposited WAAM layers
+- **Heat Sources**: Arc power during welding (distributed to beads), wire melting energy (subtracted from arc power)
+- **Heat Sinks**: Radiation to environment (Stefan-Boltzmann law), conduction between components (Fourier's law)
+- **Material Properties**: Temperature-dependent specific heat (Maier-Kelley equation), constant thermal conductivity and density
 
-- **run_simulation()**: Main function that orchestrates the layer-by-layer welding process. It calculates geometry, initializes temperatures, and loops through layers, welding beads sequentially.
-- **update_temperatures_with_two_bead_layers()**: Core thermal update function for the top two layers modeled at bead level. Handles heat balance including conduction, radiation, and arc power distribution.
-- **update_temperatures_with_beads()**: Alternative function for single-layer bead modeling (currently not used in main simulation).
-- **Helper Functions**: get_cp_waam() and get_cp_bp() for temperature-dependent specific heat using Maier-Kelley equation.
+### Code Structure
 
-### Arc Power Implementation
+The main simulation is implemented in `Thermal_Sim.py`:
 
-During welding, arc power is distributed as follows:
+- **Input Block**: Global parameters for easy configuration
+- **Helper Functions**: Temperature-dependent properties (e.g., `get_cp_waam()`, `get_epsilon_waam()`)
+- **ThermalModel Class**: Precomputes geometry and areas for efficient calculations
+- **run_simulation()**: Main loop that builds the part layer-by-layer
+  - Calculates bead geometries and masses
+  - Welds each bead sequentially with arc power
+  - Waits for interlayer temperature between layers
+  - Consolidates old layers for efficiency
+- **update_temperatures_vectorized()**: Core thermal solver using numpy arrays
+  - Computes heat balance (conduction, radiation, arc power)
+  - Updates temperatures with Euler explicit method
+- **Analysis Functions**: Fits wait times to linear/cubic models for robot programming
 
-- **With previous bead in layer**: 50% to current bead, 25% to previous bead, 25% to underlying bead/baseplate
-- **Without previous bead**: 75% to current bead, 25% to underlying bead/baseplate
+### Discretization Levels
 
-This models localized heat input from the welding arc, focusing energy on the active weld pool and adjacent areas.
+The simulation uses a hybrid discretization approach for computational efficiency:
 
-### Heat Transfer Mechanisms
+- **Bead-Level (N_LAYERS_AS_BEADS)**: Top layers modeled as individual weld tracks. Captures sequential deposition, overlap heating, and localized arc effects.
+- **Element-Level (N_LAYERS_WITH_ELEMENTS)**: Prepared for subdividing beads into smaller elements along the track length. Currently disabled (set to 0) but ready for finer resolution.
+- **Consolidated Layers**: Older layers lumped into single thermal nodes.
 
-- **Conduction**: Between table-baseplate, baseplate-layers, and within bead overlap zones using Fourier's law
-- **Radiation**: To environment using Stefan-Boltzmann law, accounting for exposed surface areas
-- **Arc Power**: Time-dependent heat input during bead welding, distributed as described above
+### Arc Power and Heat Transfer
 
-### Bead-Level Modeling
+- **Arc Power Distribution**: During welding, effective power (arc minus wire melting) is distributed:
+  - 50% to current bead, 25% to previous bead (if exists), 25% to underlying layer/baseplate
+  - Or 75%/25% if no previous bead
+- **Wire Melting**: Calculated via numerical integration of temperature-dependent specific heat
+- **Conduction**: Between table-baseplate, layers, and bead overlaps
+- **Radiation**: From all exposed surfaces, with temperature-dependent emissivity (lower for molten metal)
 
-The top two layers are modeled with individual beads to capture:
+### Numerical Methods
 
-- Sequential deposition effects
-- Overlap geometry and heat accumulation
-- Localized arc power distribution
-
-Older layers are consolidated into lumped nodes for computational efficiency.
-
-### Output Analysis
-
-- **Wait Times**: Calculated interlayer cooling times fitted with linear (a + b*i) or cubic (a + b*i + c*i² + d*i³) functions
-- **Temperature Profiles**: Time-series plots showing thermal evolution of all components
-- **Fitting Parameters**: Used to predict robot wait times for process optimization
-
-## Simulation Details
-
-The simulation uses:
-
-- **Euler explicit method** for time-stepping temperature updates
-- **Maier-Kelley equation** for temperature-dependent specific heat of WAAM wire and base plate
-- **Fourier's law** for heat conduction between components and within bead overlap zones
-- **Stefan-Boltzmann law** for radiative heat loss from all exposed surfaces (sides and top)
-- **Bead-level modeling** for the top two layers: Individual weld tracks are simulated with arc power distribution
-- **Mass-weighted averaging** for temperature calculations during layer consolidation
-- **Layer consolidation** after cooling to maintain computational efficiency for older layers
+- **Time Integration**: Euler explicit (simple, stable for small DT)
+- **Spatial Discretization**: Lumped nodes for efficiency, with bead-level detail for top layers
+- **Stability Checks**: Automatic validation of DT against thermal diffusivity
+- **Performance**: Numpy vectorization for fast computation
 
 ## Output
 
-- **Console output**: Number of layers, mode, calculated wait times, and fitted robot parameters (base time and factor for linear, or coefficients a,b,c,d for cubic with a >= 0 constraint)
-- **Plots**: Temperature vs. time for all components (with bead-level detail for top layers), and wait time per layer with linear or cubic fit
+- **Console output**: Validation messages, simulation progress, fitted robot parameters
+- **Plots**:
+  - Temperature vs. time for all components (showing bead-level detail)
+  - Wait time per layer with linear/cubic fit
 
 ## Limitations
 
-This simulation provides an advanced thermal model for WAAM processes with several assumptions and constraints:
-
-- **Quasi-2D Model for Top Layers**: The top two layers are modeled at bead-level (individual weld tracks), while older layers use a simplified 1D lumped approach. This balances accuracy with computational efficiency.
-- **Simplified Arc Physics**: Heat input during welding is modeled as distributed power input rather than detailed plasma physics or wire melting dynamics.
-- **1D Heat Transfer Within Components**: Spatial temperature gradients within the table, base plate, and individual beads are not modeled, which may lead to inaccuracies in larger geometries.
-- **Simplified Heat Transfer**: Only conduction between components, bead overlap zones, radiation, and arc power are modeled. Natural convection, forced cooling, and complex arc effects are neglected.
-- **Constant Material Properties**: Thermal conductivity and density are assumed constant, while only specific heat capacity varies with temperature (Maier-Kelley for WAAM wire and base plate).
-- **Fixed Time Steps**: The simulation uses a fixed time step (DT), which may not be optimal for all phases of the process.
-- **Idealized Geometry**: Bead geometries, contact areas, and layer shapes are approximated. Real WAAM beads have variable cross-sections and complex overlap patterns.
-- **No Detailed Welding Physics**: Heat input during welding uses simplified power distribution. Actual arc physics, including energy deposition rates and wire feed dynamics, are not modeled.
-
-**Conservative Interlayer Time Estimation**: Despite these simplifications, the bead-level modeling and arc power effects provide more realistic thermal predictions than purely lumped models. The calculated interlayer wait times tend to be conservative, ensuring safe temperature control in real-world WAAM applications.
+- Quasi-2D model with simplified geometries
+- No spatial gradients within components
+- Simplified arc physics (no plasma modeling)
+- Fixed time steps (may need tuning for stability)
+- Conservative interlayer time estimates for safety
 
 ## License
 
