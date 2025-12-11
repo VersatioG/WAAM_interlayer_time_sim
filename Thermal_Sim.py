@@ -11,6 +11,7 @@ from scipy.integrate import quad
 # --- Simulation Settings ---
 MODE = 2  # 1: Fixed wait time after 1st layer | 2: Always wait for temperature
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
+LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage and plotting overhead
 
 # --- Discretization Settings (counted from top) ---
 # NOTE: Element-level discretization increases computational cost significantly.
@@ -19,8 +20,8 @@ DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
-N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_LAYERS_AS_BEADS = 3       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 2  # Number of top layers where beads are subdivided into elements (0 = disabled)
 N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
@@ -34,12 +35,12 @@ NUMBER_OF_TRACKS = 5        # Number of parallel tracks per layer
 TRACK_LENGTH = 0.1         # [m] Length of each track
 
 # Process parameters
-PROCESS_SPEED = 0.006        # [m/s] Welding speed (travel speed)
+PROCESS_SPEED = 0.010        # [m/s] Welding speed (travel speed)
 MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
 INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
 MODE_1_WAIT_TIME = 30.0     # [s] Only for Mode 1: Forced pause after layer 1
-ARC_POWER = 2500.0          # [W] Total arc power during welding
-WIRE_FEED_RATE = 0.05       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
+ARC_POWER = 2270.0          # [W] Total arc power during welding
+WIRE_FEED_RATE = 0.04       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
 WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 
 # --- Robot Logic ---
@@ -366,21 +367,21 @@ def update_temperatures_vectorized(T_array, model, num_base_nodes, num_prev_bead
     if num_prev_beads > 1:
         overlap_width = model.bead_params['overlap_width']
         contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
-        for i_bead in range(num_prev_beads - 1):
-            idx = num_base_nodes + i_bead
-            q_horiz = LAMBDA_WAAM * contact_area / overlap_width * (T_array[idx+1] - T_array[idx])
-            Q_balance[idx] += q_horiz
-            Q_balance[idx+1] -= q_horiz
+        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
+        diff_T = np.diff(T_array[prev_indices])
+        q_horiz = LAMBDA_WAAM * contact_area / overlap_width * diff_T
+        Q_balance[prev_indices[:-1]] += q_horiz
+        Q_balance[prev_indices[1:]] -= q_horiz
     
     # Conduction between beads (horizontal) - current layer
     if num_current_beads > 1:
         overlap_width = model.bead_params['overlap_width']
         contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
-        for i_bead in range(num_current_beads - 1):
-            idx = num_base_nodes + num_prev_beads + i_bead
-            q_horiz = LAMBDA_WAAM * contact_area / overlap_width * (T_array[idx+1] - T_array[idx])
-            Q_balance[idx] += q_horiz
-            Q_balance[idx+1] -= q_horiz
+        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_base_nodes + num_prev_beads + num_current_beads)
+        diff_T = np.diff(T_array[curr_indices])
+        q_horiz = LAMBDA_WAAM * contact_area / overlap_width * diff_T
+        Q_balance[curr_indices[:-1]] += q_horiz
+        Q_balance[curr_indices[1:]] -= q_horiz
     
     # Vertical conduction: consolidated -> prev beads, prev beads -> current beads
     if num_prev_beads > 0:
@@ -575,6 +576,7 @@ def run_simulation():
     wait_times = []
     
     current_time = 0.0
+    logging_counter = 0
     
     # Calculate wire melting power
     power_wire_melting = calculate_wire_melting_power(
@@ -631,13 +633,15 @@ def run_simulation():
                 current_time += DT
                 
                 # Log data
-                num_prev = len(prev_layer_beads)
-                log_temps = list(combined_temps[:num_base_nodes])
-                if num_prev > 0:
-                    log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
-                if len(current_layer_beads) > 0:
-                    log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
-                log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                logging_counter += 1
+                if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                    num_prev = len(prev_layer_beads)
+                    log_temps = list(combined_temps[:num_base_nodes])
+                    if num_prev > 0:
+                        log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
+                    if len(current_layer_beads) > 0:
+                        log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
+                    log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
             
             # Update arrays from combined
             num_prev = len(prev_layer_beads)
@@ -671,11 +675,13 @@ def run_simulation():
             current_time += DT
             
             # Log
-            log_temps = list(combined_temps[:num_base_nodes])
-            if num_prev > 0:
-                log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
-            log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
-            log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+            logging_counter += 1
+            if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                log_temps = list(combined_temps[:num_base_nodes])
+                if num_prev > 0:
+                    log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
+                log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
+                log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
             
             # Update
             if num_prev > 0:
