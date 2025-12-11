@@ -155,10 +155,222 @@ def get_epsilon_waam_vectorized(temps):
 # EFFICIENT DATA STRUCTURES FOR SIMULATION
 # =============================================================================
 
+class NodeMatrix:
+    """
+    Matrix-based node tracking for layers, beads, and elements.
+    Each node has: layer_num, bead_num, element_num, and discretization level.
+    Allows easy neighbor finding (±1 indexing) and radiation surface determination.
+    """
+    
+    def __init__(self):
+        # Node attributes: layer, bead, element indices, and level type
+        self.layer_idx = []      # Layer number (0-based)
+        self.bead_idx = []       # Bead number within layer (0-based, -1 for layer-level)
+        self.element_idx = []    # Element number within bead (0-based, -1 for bead/layer-level)
+        self.level_type = []     # 'layer', 'bead', or 'element'
+        
+        # Physical properties per node
+        self.masses = []         # Mass of each node [kg]
+        self.areas = []          # Contact area (for conduction) [m²]
+        self.temperatures = []   # Current temperature [°C]
+        
+        # Special nodes (table, baseplate)
+        self.table_idx = None
+        self.bp_idx = None
+        
+    def add_node(self, layer_idx, bead_idx, element_idx, level_type, mass, area, temperature):
+        """Add a new node to the matrix."""
+        idx = len(self.layer_idx)
+        self.layer_idx.append(layer_idx)
+        self.bead_idx.append(bead_idx)
+        self.element_idx.append(element_idx)
+        self.level_type.append(level_type)
+        self.masses.append(mass)
+        self.areas.append(area)
+        self.temperatures.append(temperature)
+        return idx
+    
+    def get_top_layer_idx(self):
+        """Get the layer index of the topmost layer."""
+        if not self.layer_idx:
+            return -1
+        waam_nodes = [i for i, lt in enumerate(self.level_type) if lt != 'special']
+        if not waam_nodes:
+            return -1
+        return max(self.layer_idx[i] for i in waam_nodes)
+    
+    def get_nodes_in_layer(self, layer_idx):
+        """Get all node indices in a specific layer."""
+        return [i for i in range(len(self.layer_idx)) 
+                if self.layer_idx[i] == layer_idx and self.level_type[i] != 'special']
+    
+    def get_vertical_neighbor(self, node_idx, direction):
+        """
+        Get vertical neighbor (±1 in layer direction).
+        direction: +1 for above, -1 for below
+        Returns node index or None if not found.
+        """
+        layer = self.layer_idx[node_idx]
+        bead = self.bead_idx[node_idx]
+        element = self.element_idx[node_idx]
+        level = self.level_type[node_idx]
+        
+        target_layer = layer + direction
+        
+        # Find matching node in target layer
+        for i in range(len(self.layer_idx)):
+            if (self.layer_idx[i] == target_layer and 
+                self.bead_idx[i] == bead and 
+                self.element_idx[i] == element and
+                self.level_type[i] == level):
+                return i
+        
+        # If exact match not found, try base plate or consolidated layer
+        if target_layer < 0:
+            return self.bp_idx
+        
+        return None
+    
+    def get_horizontal_neighbor(self, node_idx, direction):
+        """
+        Get horizontal neighbor (±1 in bead direction).
+        direction: +1 for next bead, -1 for previous bead
+        Returns node index or None if not found.
+        """
+        layer = self.layer_idx[node_idx]
+        bead = self.bead_idx[node_idx]
+        element = self.element_idx[node_idx]
+        level = self.level_type[node_idx]
+        
+        if bead == -1:  # Layer-level nodes have no horizontal neighbors
+            return None
+        
+        target_bead = bead + direction
+        
+        # Find matching node in target bead
+        for i in range(len(self.layer_idx)):
+            if (self.layer_idx[i] == layer and 
+                self.bead_idx[i] == target_bead and 
+                self.element_idx[i] == element and
+                self.level_type[i] == level):
+                return i
+        
+        return None
+    
+    def get_longitudinal_neighbor(self, node_idx, direction):
+        """
+        Get longitudinal neighbor (±1 in element direction along bead).
+        direction: +1 for next element, -1 for previous element
+        Returns node index or None if not found.
+        """
+        layer = self.layer_idx[node_idx]
+        bead = self.bead_idx[node_idx]
+        element = self.element_idx[node_idx]
+        level = self.level_type[node_idx]
+        
+        if element == -1 or level != 'element':
+            return None
+        
+        target_element = element + direction
+        
+        # Find matching node
+        for i in range(len(self.layer_idx)):
+            if (self.layer_idx[i] == layer and 
+                self.bead_idx[i] == bead and 
+                self.element_idx[i] == target_element and
+                self.level_type[i] == level):
+                return i
+        
+        return None
+    
+    def compute_radiation_area(self, node_idx, top_layer_idx):
+        """
+        Compute radiation area for a node based on its position in the matrix.
+        Uses the logic: only top layer radiates with top surface, 
+        layer-level radiates full side, bead-level considers position.
+        """
+        layer = self.layer_idx[node_idx]
+        bead = self.bead_idx[node_idx]
+        element = self.element_idx[node_idx]
+        level = self.level_type[node_idx]
+        
+        if level == 'special':
+            return 0.0
+        
+        rad_area = 0.0
+        is_top = (layer == top_layer_idx)
+        
+        if level == 'layer':
+            # Consolidated layer: side surfaces only
+            if is_top:
+                rad_area += self.areas[node_idx]  # Top surface
+            rad_area += 2 * (TRACK_LENGTH * NUMBER_OF_TRACKS * (1 - TRACK_OVERLAP) + 
+                            TRACK_LENGTH) * LAYER_HEIGHT  # Simplified side area
+            
+        elif level == 'bead':
+            # Bead-level consideration
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            
+            # Top surface (only if top layer)
+            if is_top:
+                rad_area += self.areas[node_idx]
+            
+            # Count beads in this layer
+            beads_in_layer = sum(1 for i in range(len(self.layer_idx)) 
+                                if self.layer_idx[i] == layer and self.bead_idx[i] >= 0)
+            
+            # Side surfaces based on position
+            if beads_in_layer == 1:
+                # Only bead: all sides
+                rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
+            elif bead == 0 or bead == beads_in_layer - 1:
+                # First or last bead: one long side + short sides
+                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
+            else:
+                # Inner bead: only short sides
+                rad_area += 2 * bead_width * LAYER_HEIGHT
+        
+        elif level == 'element':
+            # Element-level consideration
+            element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            
+            # Top surface (only if top layer)
+            if is_top:
+                rad_area += element_length * bead_width
+            
+            # Count elements and beads
+            beads_in_layer = sum(1 for i in range(len(self.layer_idx)) 
+                                if self.layer_idx[i] == layer and self.bead_idx[i] >= 0)
+            
+            # Broad side (perpendicular to track direction)
+            if element == 0 or element == N_ELEMENTS_PER_BEAD - 1:
+                # First or last element: has broad side exposed
+                rad_area += bead_width * LAYER_HEIGHT
+            
+            # Long sides (parallel to track direction)
+            if bead == 0 or bead == beads_in_layer - 1:
+                # First or last bead: element has fraction of long side exposed
+                rad_area += element_length * LAYER_HEIGHT
+        
+        return rad_area
+    
+    def to_arrays(self):
+        """Convert to numpy arrays for efficient computation."""
+        return {
+            'layer_idx': np.array(self.layer_idx, dtype=np.int32),
+            'bead_idx': np.array(self.bead_idx, dtype=np.int32),
+            'element_idx': np.array(self.element_idx, dtype=np.int32),
+            'masses': np.array(self.masses, dtype=np.float64),
+            'areas': np.array(self.areas, dtype=np.float64),
+            'temperatures': np.array(self.temperatures, dtype=np.float64)
+        }
+
+
 class ThermalModel:
     """
-    Efficient thermal model using numpy arrays for simulation.
-    Stores geometry, mass, and area matrices for vectorized calculations.
+    Thermal model using NodeMatrix for efficient simulation.
+    Manages geometry and heat transfer calculations.
     """
     
     def __init__(self, layer_area, side_area_layer, bead_params):
@@ -188,268 +400,149 @@ class ThermalModel:
         self.area_bp_total = 2 * (BP_LENGTH * BP_WIDTH + 
                                    BP_LENGTH * BP_THICKNESS + 
                                    BP_WIDTH * BP_THICKNESS)
-        
-        # Pre-computed bead masses (arrays for vectorized access)
-        m_first = bead_params['m_bead_first']
-        m_subsequent = bead_params['m_bead_subsequent']
-        
-        # Bead mass array for fast lookup
-        self.bead_masses = np.array([m_first] + [m_subsequent] * (NUMBER_OF_TRACKS - 1))
-        
-        # Bead areas
-        self.bead_areas = np.array([bead_params['bead_area_first']] + 
-                                    [bead_params['bead_area_subsequent']] * (NUMBER_OF_TRACKS - 1))
-        
-        # Bead widths for radiation
-        self.bead_widths = np.array([TRACK_WIDTH] + 
-                                     [TRACK_WIDTH * (1 - TRACK_OVERLAP)] * (NUMBER_OF_TRACKS - 1))
-        
-        # Pre-compute radiation areas for all possible bead configurations
-        # Cache for different num_beads and is_top_layer combinations
-        self._rad_area_cache = {}
-        for num_beads in range(1, NUMBER_OF_TRACKS + 1):
-            self._rad_area_cache[(num_beads, True)] = self._compute_bead_rad_areas(num_beads, True)
-            self._rad_area_cache[(num_beads, False)] = self._compute_bead_rad_areas(num_beads, False)
-    
-    def _compute_bead_rad_areas(self, num_beads, is_top_layer):
-        """Internal method to compute radiation areas (called during initialization)."""
-        rad_areas = np.zeros(num_beads, dtype=np.float64)
-        
-        for i_bead in range(num_beads):
-            bead_width = self.bead_widths[i_bead] if i_bead < len(self.bead_widths) else self.bead_widths[-1]
-            bead_top = self.bead_areas[i_bead] if i_bead < len(self.bead_areas) else self.bead_areas[-1]
-            
-            rad_area = bead_top if is_top_layer else 0.0
-            
-            if num_beads == 1:
-                rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-            elif i_bead == 0:
-                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-            elif i_bead == num_beads - 1:
-                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-            else:
-                rad_area += 2 * bead_width * LAYER_HEIGHT
-            
-            rad_areas[i_bead] = rad_area
-        
-        return rad_areas
-    
-    def compute_bead_radiation_areas(self, num_beads, is_top_layer=True):
-        """
-        Get cached radiation areas for beads in a layer.
-        Uses pre-computed cache for O(1) lookup.
-        
-        Args:
-            num_beads: Number of beads currently in layer
-            is_top_layer: Whether this is the top layer (affects top surface radiation)
-        
-        Returns:
-            numpy array of radiation areas for each bead
-        """
-        if num_beads == 0:
-            return np.array([], dtype=np.float64)
-        
-        # Use cache if available
-        key = (num_beads, is_top_layer)
-        if key in self._rad_area_cache:
-            return self._rad_area_cache[key]
-        
-        # Fallback to calculation if not in cache
-        return self._compute_bead_rad_areas(num_beads, is_top_layer)
 
 
-def update_temperatures_vectorized(T_array, model, num_base_nodes, num_prev_beads, 
-                                    is_welding=False, arc_power=0.0, current_bead_idx=0):
+def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0.0, welding_node_idx=None):
     """
-    Efficient temperature update using numpy operations.
+    Update temperatures using NodeMatrix for efficient neighbor finding and radiation calculation.
     
     Args:
-        T_array: numpy array of current temperatures
+        node_matrix: NodeMatrix instance with all nodes
         model: ThermalModel instance with precomputed geometry
-        num_base_nodes: Number of base nodes (table + bp + consolidated layers)
-        num_prev_beads: Number of beads in previous layer
         is_welding: Whether arc power is active
         arc_power: Effective arc power [W]
-        current_bead_idx: Index of bead being welded
-    
-    Returns:
-        numpy array of updated temperatures
+        welding_node_idx: Index of node being welded
     """
-    num_nodes = len(T_array)
-    num_current_beads = num_nodes - num_base_nodes - num_prev_beads
-    
-    # Initialize heat balance array
+    num_nodes = len(node_matrix.temperatures)
     Q_balance = np.zeros(num_nodes, dtype=np.float64)
     
+    # Get temperature array
+    T = np.array(node_matrix.temperatures, dtype=np.float64)
+    
     # --- Arc power during welding ---
-    if is_welding and arc_power > 0:
-        current_bead_node = num_base_nodes + num_prev_beads + current_bead_idx
+    if is_welding and arc_power > 0 and welding_node_idx is not None:
+        # Distribute arc power: 50% to current, 25% to horizontal neighbor, 25% to vertical neighbor
+        Q_balance[welding_node_idx] += 0.5 * arc_power
         
-        if current_bead_idx > 0:
-            # Has previous bead: 50% current, 25% previous, 25% below
-            Q_balance[current_bead_node] += 0.5 * arc_power
-            prev_bead_node = current_bead_node - 1
-            Q_balance[prev_bead_node] += 0.25 * arc_power
-            if num_prev_beads > 0:
-                bead_below = num_base_nodes + current_bead_idx
-                Q_balance[bead_below] += 0.25 * arc_power
+        # Horizontal neighbor (previous bead in same layer)
+        h_neighbor = node_matrix.get_horizontal_neighbor(welding_node_idx, -1)
+        if h_neighbor is not None:
+            Q_balance[h_neighbor] += 0.25 * arc_power
+            # Vertical neighbor gets remaining 25%
+            v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
+            if v_neighbor is not None:
+                Q_balance[v_neighbor] += 0.25 * arc_power
             else:
-                Q_balance[1] += 0.25 * arc_power  # Baseplate
+                Q_balance[node_matrix.bp_idx] += 0.25 * arc_power
         else:
-            # No previous bead: 75% current, 25% below
-            Q_balance[current_bead_node] += 0.75 * arc_power
-            if num_prev_beads > 0:
-                bead_below = num_base_nodes + current_bead_idx
-                Q_balance[bead_below] += 0.25 * arc_power
+            # No horizontal neighbor: 75% to current, 25% to vertical
+            Q_balance[welding_node_idx] += 0.25 * arc_power
+            v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
+            if v_neighbor is not None:
+                Q_balance[v_neighbor] += 0.25 * arc_power
             else:
-                Q_balance[1] += 0.25 * arc_power
+                Q_balance[node_matrix.bp_idx] += 0.25 * arc_power
     
     # --- Radiation ---
-    T_K4 = (T_array + 273.15)**4
+    T_K4 = (T + 273.15)**4
     T_amb_K4 = (AMBIENT_TEMP + 273.15)**4
+    top_layer_idx = node_matrix.get_top_layer_idx()
     
     # Table radiation
-    Q_balance[0] -= EPSILON_TABLE * STEFAN_BOLTZMANN * model.area_table_rad * (T_K4[0] - T_amb_K4)
+    if node_matrix.table_idx is not None:
+        Q_balance[node_matrix.table_idx] -= (EPSILON_TABLE * STEFAN_BOLTZMANN * 
+                                              model.area_table_rad * 
+                                              (T_K4[node_matrix.table_idx] - T_amb_K4))
     
-    # Base plate radiation
-    num_consolidated = num_base_nodes - 2
-    total_bead_area = 0.0
-    if num_prev_beads > 0:
-        total_bead_area += np.sum(model.bead_areas[:num_prev_beads])
-    if num_current_beads > 0:
-        total_bead_area += np.sum(model.bead_areas[:num_current_beads])
-    covered_area = num_consolidated * model.layer_area + total_bead_area
-    eff_bp_area = max(0, model.area_bp_total - covered_area)
-    Q_balance[1] -= EPSILON_BP * STEFAN_BOLTZMANN * eff_bp_area * (T_K4[1] - T_amb_K4)
+    # Base plate radiation (calculate exposed area)
+    if node_matrix.bp_idx is not None:
+        covered_area = sum(node_matrix.areas[i] for i in range(num_nodes) 
+                          if node_matrix.level_type[i] != 'special')
+        eff_bp_area = max(0, model.area_bp_total - covered_area)
+        Q_balance[node_matrix.bp_idx] -= (EPSILON_BP * STEFAN_BOLTZMANN * 
+                                          eff_bp_area * 
+                                          (T_K4[node_matrix.bp_idx] - T_amb_K4))
     
-    # Consolidated layers radiation (vectorized)
-    if num_consolidated > 0:
-        layer_indices = np.arange(2, num_base_nodes)
-        epsilon_layers = get_epsilon_waam_vectorized(T_array[layer_indices])
-        Q_balance[layer_indices] -= epsilon_layers * STEFAN_BOLTZMANN * model.side_area_layer * (T_K4[layer_indices] - T_amb_K4)
-    
-    # Previous layer beads radiation
-    if num_prev_beads > 0:
-        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
-        prev_rad_areas = model.compute_bead_radiation_areas(num_prev_beads, is_top_layer=False)
-        epsilon_prev = get_epsilon_waam_vectorized(T_array[prev_indices])
-        Q_balance[prev_indices] -= epsilon_prev * STEFAN_BOLTZMANN * prev_rad_areas * (T_K4[prev_indices] - T_amb_K4)
-    
-    # Current layer beads radiation
-    if num_current_beads > 0:
-        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_nodes)
-        curr_rad_areas = model.compute_bead_radiation_areas(num_current_beads, is_top_layer=True)
-        epsilon_curr = get_epsilon_waam_vectorized(T_array[curr_indices])
-        Q_balance[curr_indices] -= epsilon_curr * STEFAN_BOLTZMANN * curr_rad_areas * (T_K4[curr_indices] - T_amb_K4)
+    # WAAM nodes radiation (using matrix logic)
+    for i in range(num_nodes):
+        if node_matrix.level_type[i] == 'special':
+            continue
+        
+        rad_area = node_matrix.compute_radiation_area(i, top_layer_idx)
+        epsilon = get_epsilon_waam(T[i])
+        Q_balance[i] -= epsilon * STEFAN_BOLTZMANN * rad_area * (T_K4[i] - T_amb_K4)
     
     # --- Conduction ---
     # Table <-> Base plate
-    q_contact = ALPHA_CONTACT * CONTACT_BP_TABLE * (T_array[1] - T_array[0])
-    Q_balance[0] += q_contact
-    Q_balance[1] -= q_contact
+    if node_matrix.table_idx is not None and node_matrix.bp_idx is not None:
+        q_contact = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[node_matrix.bp_idx] - T[node_matrix.table_idx])
+        Q_balance[node_matrix.table_idx] += q_contact
+        Q_balance[node_matrix.bp_idx] -= q_contact
     
-    # Base plate <-> first layer (or first beads)
-    if num_consolidated > 0:
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        q_cond = lam_eff * model.layer_area / dist * (T_array[2] - T_array[1])
-        Q_balance[1] += q_cond
-        Q_balance[2] -= q_cond
+    # Conduction between all nodes (using neighbor finding)
+    for i in range(num_nodes):
+        if node_matrix.level_type[i] == 'special' and i != node_matrix.bp_idx:
+            continue
         
-        # Between consolidated layers (vectorized)
-        if num_consolidated > 1:
-            for i in range(2, num_base_nodes - 1):
-                q_layer = LAMBDA_WAAM * model.layer_area / LAYER_HEIGHT * (T_array[i+1] - T_array[i])
-                Q_balance[i] += q_layer
-                Q_balance[i+1] -= q_layer
-    
-    # Conduction between beads (horizontal) - previous layer
-    if num_prev_beads > 1:
-        overlap_width = model.bead_params['overlap_width']
-        contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
-        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
-        diff_T = np.diff(T_array[prev_indices])
-        q_horiz = LAMBDA_WAAM * contact_area / overlap_width * diff_T
-        Q_balance[prev_indices[:-1]] += q_horiz
-        Q_balance[prev_indices[1:]] -= q_horiz
-    
-    # Conduction between beads (horizontal) - current layer
-    if num_current_beads > 1:
-        overlap_width = model.bead_params['overlap_width']
-        contact_area = model.bead_params['bead_contact_area'] * LAYER_HEIGHT
-        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_base_nodes + num_prev_beads + num_current_beads)
-        diff_T = np.diff(T_array[curr_indices])
-        q_horiz = LAMBDA_WAAM * contact_area / overlap_width * diff_T
-        Q_balance[curr_indices[:-1]] += q_horiz
-        Q_balance[curr_indices[1:]] -= q_horiz
-    
-    # Vertical conduction: consolidated -> prev beads, prev beads -> current beads
-    if num_prev_beads > 0:
-        # Consolidated or BP -> prev beads
-        dist = LAYER_HEIGHT if num_consolidated > 0 else (BP_THICKNESS / 2 + LAYER_HEIGHT / 2)
-        lam = LAMBDA_WAAM if num_consolidated > 0 else (LAMBDA_BP + LAMBDA_WAAM) / 2
-        base_idx = num_base_nodes - 1 if num_consolidated > 0 else 1
+        # Vertical conduction (upward)
+        v_up = node_matrix.get_vertical_neighbor(i, +1)
+        if v_up is not None:
+            # Determine distance and thermal conductivity
+            if i == node_matrix.bp_idx:
+                dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
+                lam = (LAMBDA_BP + LAMBDA_WAAM) / 2
+            else:
+                dist = LAYER_HEIGHT
+                lam = LAMBDA_WAAM
+            
+            area = node_matrix.areas[v_up]
+            q_vert = lam * area / dist * (T[v_up] - T[i])
+            Q_balance[i] += q_vert
+            Q_balance[v_up] -= q_vert
         
-        for i_bead in range(num_prev_beads):
-            bead_idx = num_base_nodes + i_bead
-            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
-            q_vert = lam * area / dist * (T_array[bead_idx] - T_array[base_idx])
-            Q_balance[base_idx] += q_vert
-            Q_balance[bead_idx] -= q_vert
-    
-    # Prev beads -> current beads (vertical)
-    if num_prev_beads > 0 and num_current_beads > 0:
-        for i_bead in range(num_current_beads):
-            curr_idx = num_base_nodes + num_prev_beads + i_bead
-            prev_idx = num_base_nodes + i_bead
-            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
-            q_vert = LAMBDA_WAAM * area / LAYER_HEIGHT * (T_array[curr_idx] - T_array[prev_idx])
-            Q_balance[prev_idx] += q_vert
-            Q_balance[curr_idx] -= q_vert
-    elif num_current_beads > 0:
-        # Current beads directly on consolidated layer or BP
-        dist = LAYER_HEIGHT if num_consolidated > 0 else (BP_THICKNESS / 2 + LAYER_HEIGHT / 2)
-        lam = LAMBDA_WAAM if num_consolidated > 0 else (LAMBDA_BP + LAMBDA_WAAM) / 2
-        base_idx = num_base_nodes - 1 if num_consolidated > 0 else 1
+        # Horizontal conduction (rightward - to avoid double counting)
+        h_right = node_matrix.get_horizontal_neighbor(i, +1)
+        if h_right is not None:
+            overlap_width = TRACK_WIDTH * TRACK_OVERLAP
+            contact_area = overlap_width * TRACK_LENGTH
+            dist = overlap_width
+            q_horiz = LAMBDA_WAAM * contact_area / dist * (T[h_right] - T[i])
+            Q_balance[i] += q_horiz
+            Q_balance[h_right] -= q_horiz
         
-        for i_bead in range(num_current_beads):
-            curr_idx = num_base_nodes + num_prev_beads + i_bead
-            area = model.bead_areas[i_bead] if i_bead < len(model.bead_areas) else model.bead_areas[-1]
-            q_vert = lam * area / dist * (T_array[curr_idx] - T_array[base_idx])
-            Q_balance[base_idx] += q_vert
-            Q_balance[curr_idx] -= q_vert
+        # Longitudinal conduction (forward - to avoid double counting)
+        l_forward = node_matrix.get_longitudinal_neighbor(i, +1)
+        if l_forward is not None:
+            element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
+            bead_width = (TRACK_WIDTH if node_matrix.bead_idx[i] == 0 
+                         else TRACK_WIDTH * (1 - TRACK_OVERLAP))
+            area = bead_width * LAYER_HEIGHT
+            dist = element_length
+            q_long = LAMBDA_WAAM * area / dist * (T[l_forward] - T[i])
+            Q_balance[i] += q_long
+            Q_balance[l_forward] -= q_long
     
-    # --- Temperature update (Euler explicit) ---
-    new_T = T_array.copy()
+    # --- Temperature Update (Euler explicit) ---
+    new_T = T.copy()
     
-    # Table
-    new_T[0] += (Q_balance[0] * DT) / (model.m_table * CP_TABLE)
+    for i in range(num_nodes):
+        if i == node_matrix.table_idx:
+            new_T[i] += (Q_balance[i] * DT) / (model.m_table * CP_TABLE)
+        elif i == node_matrix.bp_idx:
+            cp = get_cp_bp(T[i])
+            new_T[i] += (Q_balance[i] * DT) / (model.m_bp * cp)
+        elif node_matrix.level_type[i] == 'layer':
+            cp = get_cp_waam(T[i])
+            new_T[i] += (Q_balance[i] * DT) / (model.m_layer * cp)
+        else:  # bead or element level
+            cp = get_cp_waam(T[i])
+            mass = node_matrix.masses[i]
+            new_T[i] += (Q_balance[i] * DT) / (mass * cp)
     
-    # Base plate
-    cp_bp = get_cp_bp(T_array[1])
-    new_T[1] += (Q_balance[1] * DT) / (model.m_bp * cp_bp)
+    # Update node_matrix temperatures
+    node_matrix.temperatures = new_T.tolist()
     
-    # Consolidated layers (vectorized)
-    if num_consolidated > 0:
-        layer_indices = np.arange(2, num_base_nodes)
-        cp_layers = get_cp_waam_vectorized(T_array[layer_indices])
-        new_T[layer_indices] += (Q_balance[layer_indices] * DT) / (model.m_layer * cp_layers)
-    
-    # Previous layer beads
-    if num_prev_beads > 0:
-        prev_indices = np.arange(num_base_nodes, num_base_nodes + num_prev_beads)
-        cp_prev = get_cp_waam_vectorized(T_array[prev_indices])
-        masses_prev = model.bead_masses[:num_prev_beads]
-        new_T[prev_indices] += (Q_balance[prev_indices] * DT) / (masses_prev * cp_prev)
-    
-    # Current layer beads
-    if num_current_beads > 0:
-        curr_indices = np.arange(num_base_nodes + num_prev_beads, num_nodes)
-        cp_curr = get_cp_waam_vectorized(T_array[curr_indices])
-        masses_curr = model.bead_masses[:num_current_beads]
-        new_T[curr_indices] += (Q_balance[curr_indices] * DT) / (masses_curr * cp_curr)
-    
-    return new_T
+    return node_matrix
 
 
 def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, melting_temp, rho_wire):
@@ -491,8 +584,8 @@ def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, me
 
 def run_simulation():
     """
-    Main simulation function using efficient numpy arrays.
-    Uses ThermalModel class for precomputed geometry parameters.
+    Main simulation function using NodeMatrix for efficient layer/bead/element tracking.
+    Uses new matrix-based logic for neighbor finding and radiation calculation.
     """
     # --- Input validation ---
     if N_LAYERS_AS_BEADS > NUMBER_OF_LAYERS:
@@ -507,26 +600,23 @@ def run_simulation():
     if DT <= 0:
         raise ValueError(f"DT ({DT}) must be > 0")
     
-    # Check DT stability (rough estimate based on thermal diffusivity)
-    # Thermal diffusivity alpha = lambda / (rho * cp) ≈ 4e-6 m²/s for steel
-    alpha = LAMBDA_WAAM / (RHO_WAAM * CP_WAAM_A)  # Approximate using solid cp
+    # Check DT stability
+    alpha = LAMBDA_WAAM / (RHO_WAAM * CP_WAAM_A)
     dx_min = min(LAYER_HEIGHT, TRACK_WIDTH / max(N_ELEMENTS_PER_BEAD, 1))
     dt_max_stable = dx_min**2 / (2 * alpha)
     if DT > dt_max_stable:
         print(f"Warning: DT ({DT:.3f}s) may be too large for stability. Recommended max: {dt_max_stable:.3f}s")
-        print("Consider reducing DT for better accuracy and stability.")
     
-    # Calculate effective layer geometry
+    # Calculate geometry
     effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
     layer_area = effective_layer_width * TRACK_LENGTH
     layer_volume = layer_area * LAYER_HEIGHT
     side_area_layer = 2 * (TRACK_LENGTH * LAYER_HEIGHT + effective_layer_width * LAYER_HEIGHT)
     
-    # Calculate layer duration
     total_weld_distance = NUMBER_OF_TRACKS * TRACK_LENGTH
     layer_duration = total_weld_distance / PROCESS_SPEED
     
-    # --- Bead geometry ---
+    # Bead geometry
     bead_width_effective = TRACK_WIDTH * (1 - TRACK_OVERLAP)
     bead_area_first = TRACK_WIDTH * TRACK_LENGTH
     bead_area_subsequent = bead_width_effective * TRACK_LENGTH
@@ -534,39 +624,44 @@ def run_simulation():
     bead_volume_subsequent = bead_area_subsequent * LAYER_HEIGHT
     m_bead_first = bead_volume_first * RHO_WAAM
     m_bead_subsequent = bead_volume_subsequent * RHO_WAAM
-    
-    side_area_bead_first = 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * TRACK_WIDTH * LAYER_HEIGHT
-    side_area_bead_subsequent = 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width_effective * LAYER_HEIGHT
-    
     overlap_width = TRACK_WIDTH * TRACK_OVERLAP
     bead_contact_area = overlap_width * TRACK_LENGTH
     bead_duration = TRACK_LENGTH / PROCESS_SPEED
     
-    # Initialize masses
+    # Element geometry (if enabled)
+    element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
+    element_duration = element_length / PROCESS_SPEED
+    
     vol_bp = BP_LENGTH * BP_WIDTH * BP_THICKNESS
     m_bp = vol_bp * RHO_BP
     vol_table = TABLE_LENGTH * TABLE_WIDTH * TABLE_THICKNESS
     m_table = vol_table * RHO_TABLE
     m_layer = layer_volume * RHO_WAAM
     
-    # Bead parameters dictionary
     bead_params = {
         'bead_area_first': bead_area_first,
         'bead_area_subsequent': bead_area_subsequent,
         'm_bead_first': m_bead_first,
         'm_bead_subsequent': m_bead_subsequent,
-        'side_area_bead_first': side_area_bead_first,
-        'side_area_bead_subsequent': side_area_bead_subsequent,
         'bead_contact_area': bead_contact_area,
         'bead_duration': bead_duration,
         'overlap_width': overlap_width
     }
     
-    # Create thermal model for efficient calculations
     thermal_model = ThermalModel(layer_area, side_area_layer, bead_params)
     
-    # Temperature array (start at ambient) - using numpy for efficiency
-    temps = np.array([AMBIENT_TEMP, AMBIENT_TEMP], dtype=np.float64)
+    # Initialize NodeMatrix
+    node_matrix = NodeMatrix()
+    
+    # Add table and baseplate nodes
+    node_matrix.table_idx = node_matrix.add_node(
+        layer_idx=-2, bead_idx=-1, element_idx=-1, level_type='special',
+        mass=m_table, area=0.0, temperature=AMBIENT_TEMP
+    )
+    node_matrix.bp_idx = node_matrix.add_node(
+        layer_idx=-1, bead_idx=-1, element_idx=-1, level_type='special',
+        mass=m_bp, area=0.0, temperature=AMBIENT_TEMP
+    )
     
     # Result storage
     time_log = []
@@ -585,8 +680,7 @@ def run_simulation():
     effective_arc_power = ARC_POWER - power_wire_melting
     
     if effective_arc_power < 0:
-        raise ValueError(f"Arc power ({ARC_POWER:.1f} W) insufficient to melt wire. "
-                        f"Wire melting requires {power_wire_melting:.1f} W.")
+        raise ValueError(f"Arc power ({ARC_POWER:.1f} W) insufficient to melt wire.")
     
     print(f"Starting simulation (Mode {MODE})...")
     print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
@@ -598,68 +692,94 @@ def run_simulation():
     # Main simulation loop
     for i_layer in tqdm(range(NUMBER_OF_LAYERS)):
         
-        # Determine structure based on layer position
-        if i_layer == 0:
-            # First layer: [table, bp] + current_beads
-            base_temps = temps.copy()
-            num_base_nodes = len(base_temps)
-            prev_layer_beads = np.array([], dtype=np.float64)
-            current_layer_beads = np.array([], dtype=np.float64)
-        else:
-            # Subsequent layers: Expand previous layer to beads
-            base_temps = temps[:-1].copy()
-            num_base_nodes = len(base_temps)
-            prev_layer_temp = temps[-1]
-            prev_layer_beads = np.full(NUMBER_OF_TRACKS, prev_layer_temp, dtype=np.float64)
-            current_layer_beads = np.array([], dtype=np.float64)
+        # Determine discretization level for this layer
+        layers_from_top = NUMBER_OF_LAYERS - i_layer - 1
+        use_beads = layers_from_top < N_LAYERS_AS_BEADS
+        use_elements = layers_from_top < N_LAYERS_WITH_ELEMENTS
         
-        # 1. Weld each bead sequentially
-        for i_bead in range(NUMBER_OF_TRACKS):
-            # Add new bead at melting temperature
-            current_layer_beads = np.append(current_layer_beads, MELTING_TEMP)
+        if use_beads:
+            # Bead-level or element-level discretization
+            for i_bead in range(NUMBER_OF_TRACKS):
+                bead_area = bead_area_first if i_bead == 0 else bead_area_subsequent
+                bead_mass = m_bead_first if i_bead == 0 else m_bead_subsequent
+                
+                if use_elements:
+                    # Element-level: subdivide bead into elements
+                    for i_element in range(N_ELEMENTS_PER_BEAD):
+                        element_area = bead_area / N_ELEMENTS_PER_BEAD
+                        element_mass = bead_mass / N_ELEMENTS_PER_BEAD
+                        
+                        welding_node_idx = node_matrix.add_node(
+                            layer_idx=i_layer, bead_idx=i_bead, element_idx=i_element,
+                            level_type='element', mass=element_mass, area=element_area,
+                            temperature=MELTING_TEMP
+                        )
+                        
+                        # Simulate welding of this element
+                        steps = int(element_duration / DT)
+                        for _ in range(steps):
+                            node_matrix = update_temperatures_matrix(
+                                node_matrix, thermal_model, is_welding=True,
+                                arc_power=effective_arc_power, welding_node_idx=welding_node_idx
+                            )
+                            current_time += DT
+                            
+                            logging_counter += 1
+                            if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+                else:
+                    # Bead-level: add whole bead
+                    welding_node_idx = node_matrix.add_node(
+                        layer_idx=i_layer, bead_idx=i_bead, element_idx=-1,
+                        level_type='bead', mass=bead_mass, area=bead_area,
+                        temperature=MELTING_TEMP
+                    )
+                    
+                    # Simulate welding of this bead
+                    steps = int(bead_duration / DT)
+                    for _ in range(steps):
+                        node_matrix = update_temperatures_matrix(
+                            node_matrix, thermal_model, is_welding=True,
+                            arc_power=effective_arc_power, welding_node_idx=welding_node_idx
+                        )
+                        current_time += DT
+                        
+                        logging_counter += 1
+                        if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                            log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
+        else:
+            # Layer-level: add entire layer as single node
+            layer_node_idx = node_matrix.add_node(
+                layer_idx=i_layer, bead_idx=-1, element_idx=-1,
+                level_type='layer', mass=m_layer, area=layer_area,
+                temperature=MELTING_TEMP
+            )
             
-            # Create combined temperature array
-            combined_temps = np.concatenate([base_temps, prev_layer_beads, current_layer_beads])
-            
-            # Simulate welding of this bead
-            steps_bead = int(bead_duration / DT)
-            
-            for _ in range(steps_bead):
-                combined_temps = update_temperatures_vectorized(
-                    combined_temps, thermal_model, num_base_nodes, 
-                    len(prev_layer_beads), is_welding=True, 
-                    arc_power=effective_arc_power, current_bead_idx=i_bead
+            # Simulate entire layer deposition
+            steps = int(layer_duration / DT)
+            for _ in range(steps):
+                node_matrix = update_temperatures_matrix(
+                    node_matrix, thermal_model, is_welding=True,
+                    arc_power=effective_arc_power, welding_node_idx=layer_node_idx
                 )
                 current_time += DT
                 
-                # Log data
                 logging_counter += 1
                 if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                    num_prev = len(prev_layer_beads)
-                    log_temps = list(combined_temps[:num_base_nodes])
-                    if num_prev > 0:
-                        log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
-                    if len(current_layer_beads) > 0:
-                        log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
-                    log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
-            
-            # Update arrays from combined
-            num_prev = len(prev_layer_beads)
-            if num_prev > 0:
-                prev_layer_beads = combined_temps[num_base_nodes:num_base_nodes + num_prev].copy()
-            current_layer_beads = combined_temps[num_base_nodes + num_prev:].copy()
-            base_temps = combined_temps[:num_base_nodes].copy()
+                    log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
         
-        # 2. Cool until interpass temperature reached
+        # Cool until interpass temperature reached
         time_start_wait = current_time
-        combined_temps = np.concatenate([base_temps, prev_layer_beads, current_layer_beads])
         
         while True:
-            num_prev = len(prev_layer_beads)
-            current_beads_temps = combined_temps[num_base_nodes + num_prev:]
-            t_hottest_bead = np.max(current_beads_temps) if len(current_beads_temps) > 0 else AMBIENT_TEMP
+            # Get max temperature of current layer
+            current_layer_nodes = node_matrix.get_nodes_in_layer(i_layer)
+            if current_layer_nodes:
+                t_hottest = max(node_matrix.temperatures[i] for i in current_layer_nodes)
+            else:
+                t_hottest = AMBIENT_TEMP
             
-            condition_met = t_hottest_bead <= INTERLAYER_TEMP
+            condition_met = t_hottest <= INTERLAYER_TEMP
             
             # Mode 1 special case
             if MODE == 1 and i_layer == 0:
@@ -668,653 +788,63 @@ def run_simulation():
             elif condition_met:
                 break
             
-            combined_temps = update_temperatures_vectorized(
-                combined_temps, thermal_model, num_base_nodes,
-                len(prev_layer_beads), is_welding=False
+            node_matrix = update_temperatures_matrix(
+                node_matrix, thermal_model, is_welding=False
             )
             current_time += DT
             
-            # Log
             logging_counter += 1
             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                log_temps = list(combined_temps[:num_base_nodes])
-                if num_prev > 0:
-                    log_temps.append(np.max(combined_temps[num_base_nodes:num_base_nodes + num_prev]))
-                log_temps.append(np.max(combined_temps[num_base_nodes + num_prev:]))
-                log_data(current_time, log_temps, time_log, temp_layers_log, temp_bp_log, temp_table_log)
-            
-            # Update
-            if num_prev > 0:
-                prev_layer_beads = combined_temps[num_base_nodes:num_base_nodes + num_prev].copy()
-            current_layer_beads = combined_temps[num_base_nodes + num_prev:].copy()
-            base_temps = combined_temps[:num_base_nodes].copy()
-        
-        # 3. Merge beads back to single node (mass-weighted average)
-        total_bead_mass = m_bead_first + (NUMBER_OF_TRACKS - 1) * m_bead_subsequent
-        bead_masses = np.array([m_bead_first] + [m_bead_subsequent] * (NUMBER_OF_TRACKS - 1))
-        weighted_temp = np.sum(current_layer_beads * bead_masses[:len(current_layer_beads)]) / total_bead_mass
-        
-        if len(prev_layer_beads) > 0:
-            weighted_prev_temp = np.sum(prev_layer_beads * bead_masses[:len(prev_layer_beads)]) / total_bead_mass
-            temps = np.append(base_temps, [weighted_prev_temp, weighted_temp])
-        else:
-            temps = np.append(base_temps, weighted_temp)
+                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, table_log)
         
         wait_times.append(current_time - time_start_wait)
-
+        
+        # Consolidate old layers (beyond N_LAYERS_AS_BEADS) to layer-level
+        layers_to_consolidate = i_layer - N_LAYERS_AS_BEADS + 1
+        if layers_to_consolidate > 0:
+            for layer_to_consolidate in range(layers_to_consolidate):
+                nodes_in_layer = node_matrix.get_nodes_in_layer(layer_to_consolidate)
+                if len(nodes_in_layer) > 1:
+                    # Consolidate multiple nodes into one layer-level node
+                    total_mass = sum(node_matrix.masses[i] for i in nodes_in_layer)
+                    weighted_temp = sum(node_matrix.masses[i] * node_matrix.temperatures[i] 
+                                       for i in nodes_in_layer) / total_mass
+                    
+                    # Remove old nodes (in reverse to preserve indices)
+                    for idx in sorted(nodes_in_layer, reverse=True):
+                        del node_matrix.layer_idx[idx]
+                        del node_matrix.bead_idx[idx]
+                        del node_matrix.element_idx[idx]
+                        del node_matrix.level_type[idx]
+                        del node_matrix.masses[idx]
+                        del node_matrix.areas[idx]
+                        del node_matrix.temperatures[idx]
+                    
+                    # Add consolidated layer node
+                    node_matrix.add_node(
+                        layer_idx=layer_to_consolidate, bead_idx=-1, element_idx=-1,
+                        level_type='layer', mass=m_layer, area=layer_area,
+                        temperature=weighted_temp
+                    )
+    
     return time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
 
-def update_temperatures_with_two_bead_layers(T, m_t, m_bp, m_l, layer_area, side_area_layer,
-                                               num_base_nodes, num_prev_beads, bead_params, is_welding=False, arc_power=0.0, current_bead_idx=0):
-    """
-    Calculates one time step DT for all nodes including two layers of individual beads.
-    T: [table, base plate, consolidated_layers..., prev_layer_beads..., current_layer_beads...]
-    num_base_nodes: Number of nodes before beads (table + bp + consolidated layers)
-    num_prev_beads: Number of beads in previous layer (0 if first layer)
-    bead_params: Dictionary with bead geometry parameters
-    current_bead_idx: Index of the bead currently being welded (0-based within current layer)
-    """
-    new_T = list(T)
-    num_nodes = len(T)
-    num_current_beads = num_nodes - num_base_nodes - num_prev_beads
-    
-    # Extract bead parameters
-    bead_area_first = bead_params['bead_area_first']
-    bead_area_subsequent = bead_params['bead_area_subsequent']
-    m_bead_first = bead_params['m_bead_first']
-    m_bead_subsequent = bead_params['m_bead_subsequent']
-    side_area_bead_first = bead_params['side_area_bead_first']
-    side_area_bead_subsequent = bead_params['side_area_bead_subsequent']
-    bead_contact_area = bead_params['bead_contact_area']
-    
-    # Q_dot array initialization
-    Q_balance = np.zeros(num_nodes)
-    
-    # --- Arc power during welding ---
-    # Distribute arc power to: current bead, previous bead (if not first), and bead below (or baseplate for first layer)
-    if is_welding and arc_power > 0:
-        # Determine which nodes receive arc power
-        heated_nodes = []
-        
-        # 1. Current bead (always receives power)
-        current_bead_node_idx = num_base_nodes + num_prev_beads + current_bead_idx
-        heated_nodes.append(current_bead_node_idx)
-        
-        # 2. Previous bead in same layer (if not first bead)
-        if current_bead_idx > 0:
-            prev_bead_node_idx = num_base_nodes + num_prev_beads + current_bead_idx - 1
-            heated_nodes.append(prev_bead_node_idx)
-        
-        # 3. Bead below (in previous layer) or baseplate (for first layer)
-        if num_prev_beads > 0:
-            # There is a previous layer - heat the corresponding bead below
-            bead_below_node_idx = num_base_nodes + current_bead_idx
-            heated_nodes.append(bead_below_node_idx)
-        else:
-            # First layer - heat the baseplate instead
-            heated_nodes.append(1)  # Index 1 is baseplate
-        
-        # Distribute power according to specified percentages
-        # 50% to current bead, 25% to previous (if exists), 25% to below
-        # If no previous: 75% to current, 25% to below
-        if current_bead_idx > 0:
-            # Has previous bead: 50% current, 25% previous, 25% below
-            Q_balance[current_bead_node_idx] += 0.5 * arc_power
-            prev_bead_node_idx = num_base_nodes + num_prev_beads + current_bead_idx - 1
-            Q_balance[prev_bead_node_idx] += 0.25 * arc_power
-            if num_prev_beads > 0:
-                bead_below_node_idx = num_base_nodes + current_bead_idx
-                Q_balance[bead_below_node_idx] += 0.25 * arc_power
-            else:
-                Q_balance[1] += 0.25 * arc_power  # Baseplate
-        else:
-            # No previous bead: 75% current, 25% below
-            Q_balance[current_bead_node_idx] += 0.75 * arc_power
-            if num_prev_beads > 0:
-                bead_below_node_idx = num_base_nodes + current_bead_idx
-                Q_balance[bead_below_node_idx] += 0.25 * arc_power
-            else:
-                Q_balance[1] += 0.25 * arc_power  # Baseplate
-    
-    # --- 1. Radiation to environment ---
-    # Table
-    area_table_eff = (TABLE_LENGTH * TABLE_WIDTH) - CONTACT_BP_TABLE
-    q_rad_table = EPSILON_TABLE * STEFAN_BOLTZMANN * area_table_eff * (kelvin(T[0])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[0] -= q_rad_table
-    
-    # Base plate
-    area_bp_total = 2*(BP_LENGTH*BP_WIDTH + BP_LENGTH*BP_THICKNESS + BP_WIDTH*BP_THICKNESS)
-    num_consolidated_layers = num_base_nodes - 2
-    total_bead_area = (bead_area_first + (num_prev_beads - 1) * bead_area_subsequent if num_prev_beads > 0 else 0)
-    total_bead_area += (bead_area_first + (num_current_beads - 1) * bead_area_subsequent if num_current_beads > 0 else 0)
-    covered_area = num_consolidated_layers * layer_area + total_bead_area
-    effective_bp_rad_area = max(0, area_bp_total - covered_area)
-    q_rad_bp = EPSILON_BP * STEFAN_BOLTZMANN * effective_bp_rad_area * (kelvin(T[1])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[1] -= q_rad_bp
-    
-    # Consolidated layers radiation
-    for i in range(2, num_base_nodes):
-        epsilon_layer = get_epsilon_waam(T[i])
-        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[i] -= q_rad_layer
-    
-    # Previous layer beads radiation
-    # Previous layer: NO top surface (covered by current layer)
-    # Only side surfaces that are exposed:
-    # - First bead: 1x length*height (outer long side) + 1x width*height (front/back, but one side blocked by next bead)
-    # - Last bead: 1x length*height (outer long side) + 1x width*height (front/back, but one side blocked by prev bead)
-    # - Inner beads: 2x width*height (front and back, both long sides blocked by adjacent beads)
-    for i_bead in range(num_prev_beads):
-        bead_idx = num_base_nodes + i_bead
-        
-        # Determine bead width for this bead
-        if i_bead == 0:
-            bead_width = TRACK_WIDTH
-        else:
-            bead_width = TRACK_WIDTH * (1 - TRACK_OVERLAP)
-        
-        # Calculate radiating area based on position
-        rad_area = 0.0
-        
-        if num_prev_beads == 1:
-            # Only one bead: all sides radiate
-            rad_area = 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == 0:
-            # First bead (leftmost): outer long side + front/back (width sides)
-            rad_area = TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == num_prev_beads - 1:
-            # Last bead (rightmost): outer long side + front/back (width sides)
-            rad_area = TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        else:
-            # Inner beads: only front and back (width sides), long sides blocked by neighbors
-            rad_area = 2 * bead_width * LAYER_HEIGHT
-        
-        # No top surface radiation (covered by current layer)
-        
-        epsilon_bead = get_epsilon_waam(T[bead_idx])
-        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[bead_idx] -= q_rad_bead
-    
-    # Current layer beads radiation
-    # Current layer (top): ALL beads radiate on top surface
-    # Side surfaces:
-    # - First bead: 1x length*height (outer long side) + 1x width*height (front/back)
-    # - Last bead: 1x length*height (outer long side) + 1x width*height (front/back)
-    # - Inner beads: 2x width*height (front and back only)
-    for i_bead in range(num_current_beads):
-        bead_idx = num_base_nodes + num_prev_beads + i_bead
-        
-        # Determine bead dimensions
-        if i_bead == 0:
-            bead_width = TRACK_WIDTH
-            bead_top_area = TRACK_WIDTH * TRACK_LENGTH
-        else:
-            bead_width = TRACK_WIDTH * (1 - TRACK_OVERLAP)
-            bead_top_area = bead_width * TRACK_LENGTH
-        
-        # Top surface radiation (all beads in current layer radiate on top)
-        rad_area = bead_top_area
-        
-        # Side surfaces based on position
-        if num_current_beads == 1:
-            # Only one bead: all sides radiate
-            rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == 0:
-            # First bead: outer long side + front/back
-            rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == num_current_beads - 1:
-            # Last bead: outer long side + front/back
-            rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        else:
-            # Inner beads: only front and back
-            rad_area += 2 * bead_width * LAYER_HEIGHT
-        
-        epsilon_bead = get_epsilon_waam(T[bead_idx])
-        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[bead_idx] -= q_rad_bead
-    
-    # --- 2. Heat conduction ---
-    
-    # Table <-> Base plate
-    q_cont = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[1] - T[0])
-    Q_balance[0] += q_cont
-    Q_balance[1] -= q_cont
-    
-    # Base plate <-> Layer 1
-    if num_base_nodes > 2:
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        area_contact = layer_area
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        
-        q_cond_1 = (lam_eff * area_contact / dist) * (T[2] - T[1])
-        Q_balance[1] += q_cond_1
-        Q_balance[2] -= q_cond_1
-    
-    # Between consolidated layers
-    for i in range(2, num_base_nodes - 1):
-        dist = LAYER_HEIGHT
-        area = layer_area
-        
-        q_cond_lay = (LAMBDA_WAAM * area / dist) * (T[i+1] - T[i])
-        Q_balance[i] += q_cond_lay
-        Q_balance[i+1] -= q_cond_lay
-    
-    # Top consolidated layer <-> Previous layer beads (if exist)
-    if num_prev_beads > 0 and num_base_nodes > 2:
-        dist = LAYER_HEIGHT
-        # Contact with first bead
-        area_contact = bead_area_first
-        
-        q_cond = (LAMBDA_WAAM * area_contact / dist) * (T[num_base_nodes] - T[num_base_nodes - 1])
-        Q_balance[num_base_nodes - 1] += q_cond
-        Q_balance[num_base_nodes] -= q_cond
-    elif num_prev_beads > 0 and num_base_nodes == 2:
-        # First layer: prev beads on base plate
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        area_contact = bead_area_first
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        
-        q_cond = (lam_eff * area_contact / dist) * (T[num_base_nodes] - T[1])
-        Q_balance[1] += q_cond
-        Q_balance[num_base_nodes] -= q_cond
-    
-    # Horizontal conduction between prev layer beads
-    for i_bead in range(num_prev_beads - 1):
-        bead_idx = num_base_nodes + i_bead
-        next_bead_idx = bead_idx + 1
-        
-        dist = bead_params['overlap_width']
-        area = bead_contact_area * LAYER_HEIGHT
-        
-        q_cond_beads = (LAMBDA_WAAM * area / dist) * (T[next_bead_idx] - T[bead_idx])
-        Q_balance[bead_idx] += q_cond_beads
-        Q_balance[next_bead_idx] -= q_cond_beads
-    
-    # Subsequent prev beads to layer below
-    for i_bead in range(1, num_prev_beads):
-        bead_idx = num_base_nodes + i_bead
-        
-        if num_base_nodes > 2:
-            dist = LAYER_HEIGHT
-            area_contact = bead_area_subsequent
-            
-            q_cond_down = (LAMBDA_WAAM * area_contact / dist) * (T[bead_idx] - T[num_base_nodes - 1])
-            Q_balance[num_base_nodes - 1] += q_cond_down
-            Q_balance[bead_idx] -= q_cond_down
-        else:
-            dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-            area_contact = bead_area_subsequent
-            lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-            
-            q_cond_down = (lam_eff * area_contact / dist) * (T[bead_idx] - T[1])
-            Q_balance[1] += q_cond_down
-            Q_balance[bead_idx] -= q_cond_down
-    
-    # Current layer beads to prev layer beads (vertical)
-    for i_bead in range(num_current_beads):
-        bead_idx = num_base_nodes + num_prev_beads + i_bead
-        
-        if num_prev_beads > 0:
-            # Conduct to corresponding prev layer bead
-            prev_bead_idx = num_base_nodes + i_bead
-            dist = LAYER_HEIGHT
-            
-            if i_bead == 0:
-                area_contact = bead_area_first
-            else:
-                area_contact = bead_area_subsequent
-            
-            q_cond_vert = (LAMBDA_WAAM * area_contact / dist) * (T[bead_idx] - T[prev_bead_idx])
-            Q_balance[prev_bead_idx] += q_cond_vert
-            Q_balance[bead_idx] -= q_cond_vert
-        elif num_base_nodes > 2:
-            # No prev beads, conduct to top consolidated layer
-            dist = LAYER_HEIGHT
-            if i_bead == 0:
-                area_contact = bead_area_first
-            else:
-                area_contact = bead_area_subsequent
-            
-            q_cond_vert = (LAMBDA_WAAM * area_contact / dist) * (T[bead_idx] - T[num_base_nodes - 1])
-            Q_balance[num_base_nodes - 1] += q_cond_vert
-            Q_balance[bead_idx] -= q_cond_vert
-        else:
-            # First layer, no prev beads: conduct to base plate
-            dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-            if i_bead == 0:
-                area_contact = bead_area_first
-            else:
-                area_contact = bead_area_subsequent
-            lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-            
-            q_cond_vert = (lam_eff * area_contact / dist) * (T[bead_idx] - T[1])
-            Q_balance[1] += q_cond_vert
-            Q_balance[bead_idx] -= q_cond_vert
-    
-    # Horizontal conduction between current layer beads
-    for i_bead in range(num_current_beads - 1):
-        bead_idx = num_base_nodes + num_prev_beads + i_bead
-        next_bead_idx = bead_idx + 1
-        
-        dist = bead_params['overlap_width']
-        area = bead_contact_area * LAYER_HEIGHT
-        
-        q_cond_beads = (LAMBDA_WAAM * area / dist) * (T[next_bead_idx] - T[bead_idx])
-        Q_balance[bead_idx] += q_cond_beads
-        Q_balance[next_bead_idx] -= q_cond_beads
-    
-    # --- 3. Temperature Update ---
-    # Table
-    new_T[0] += (Q_balance[0] * DT) / (m_t * CP_TABLE)
-    # BP
-    cp_bp_val = get_cp_bp(T[1])
-    new_T[1] += (Q_balance[1] * DT) / (m_bp * cp_bp_val)
-    # Consolidated layers
-    for i in range(2, num_base_nodes):
-        cp_val = get_cp_waam(T[i])
-        new_T[i] += (Q_balance[i] * DT) / (m_l * cp_val)
-    # Previous layer beads
-    for i_bead in range(num_prev_beads):
-        bead_idx = num_base_nodes + i_bead
-        if i_bead == 0:
-            m_bead = m_bead_first
-        else:
-            m_bead = m_bead_subsequent
-        cp_val = get_cp_waam(T[bead_idx])
-        new_T[bead_idx] += (Q_balance[bead_idx] * DT) / (m_bead * cp_val)
-    # Current layer beads
-    for i_bead in range(num_current_beads):
-        bead_idx = num_base_nodes + num_prev_beads + i_bead
-        if i_bead == 0:
-            m_bead = m_bead_first
-        else:
-            m_bead = m_bead_subsequent
-        cp_val = get_cp_waam(T[bead_idx])
-        new_T[bead_idx] += (Q_balance[bead_idx] * DT) / (m_bead * cp_val)
-    
-    return new_T
-
-def update_temperatures_with_beads(T, m_t, m_bp, m_l, layer_area, side_area_layer,
-                                    num_base_nodes, bead_params, current_bead_idx):
-    """
-    Calculates one time step DT for all nodes including individual beads.
-    T: List of current temperatures [table, base plate, layer1, ..., layerN-1, bead1, bead2, ...]
-    num_base_nodes: Number of nodes before beads (table + bp + consolidated layers)
-    bead_params: Dictionary with bead geometry parameters
-    current_bead_idx: Index of the bead currently being welded (for determining active beads)
-    """
-    new_T = list(T)
-    num_nodes = len(T)
-    num_beads = num_nodes - num_base_nodes
-    
-    # Extract bead parameters
-    bead_area_first = bead_params['bead_area_first']
-    bead_area_subsequent = bead_params['bead_area_subsequent']
-    m_bead_first = bead_params['m_bead_first']
-    m_bead_subsequent = bead_params['m_bead_subsequent']
-    side_area_bead_first = bead_params['side_area_bead_first']
-    side_area_bead_subsequent = bead_params['side_area_bead_subsequent']
-    bead_contact_area = bead_params['bead_contact_area']
-    
-    # Q_dot array initialization (in Watts)
-    Q_balance = np.zeros(num_nodes)
-    
-    # --- 1. Radiation to environment (Boltzmann) ---
-    # Table
-    area_table_eff = (TABLE_LENGTH * TABLE_WIDTH) - CONTACT_BP_TABLE
-    q_rad_table = EPSILON_TABLE * STEFAN_BOLTZMANN * area_table_eff * (kelvin(T[0])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[0] -= q_rad_table
-    
-    # Base plate
-    area_bp_total = 2*(BP_LENGTH*BP_WIDTH + BP_LENGTH*BP_THICKNESS + BP_WIDTH*BP_THICKNESS)
-    # Subtract covered area (consolidated layers + beads)
-    num_consolidated_layers = num_base_nodes - 2
-    total_bead_area = bead_area_first + (num_beads - 1) * bead_area_subsequent if num_beads > 0 else 0
-    covered_area = num_consolidated_layers * layer_area + total_bead_area
-    effective_bp_rad_area = max(0, area_bp_total - covered_area)
-    q_rad_bp = EPSILON_BP * STEFAN_BOLTZMANN * effective_bp_rad_area * (kelvin(T[1])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[1] -= q_rad_bp
-    
-    # Consolidated layers radiation (side surfaces only, top is covered by beads/next layer)
-    for i in range(2, num_base_nodes):
-        epsilon_layer = get_epsilon_waam(T[i])
-        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * side_area_layer * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[i] -= q_rad_layer
-    
-    # Bead radiation (for single bead layer - top layer)
-    # All beads radiate on top surface
-    # Side surfaces based on position:
-    # - First bead: outer long side + front/back
-    # - Last bead: outer long side + front/back  
-    # - Inner beads: only front and back (long sides blocked by neighbors)
-    for i_bead in range(num_beads):
-        bead_idx = num_base_nodes + i_bead
-        
-        # Determine bead dimensions
-        if i_bead == 0:
-            bead_width = TRACK_WIDTH
-            bead_top_area = TRACK_WIDTH * TRACK_LENGTH
-        else:
-            bead_width = TRACK_WIDTH * (1 - TRACK_OVERLAP)
-            bead_top_area = bead_width * TRACK_LENGTH
-        
-        # Top surface radiation (all beads radiate on top)
-        rad_area = bead_top_area
-        
-        # Side surfaces based on position
-        if num_beads == 1:
-            # Only one bead: all sides radiate
-            rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == 0:
-            # First bead: outer long side + front/back
-            rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        elif i_bead == num_beads - 1:
-            # Last bead: outer long side + front/back
-            rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-        else:
-            # Inner beads: only front and back
-            rad_area += 2 * bead_width * LAYER_HEIGHT
-        
-        epsilon_bead = get_epsilon_waam(T[bead_idx])
-        q_rad_bead = epsilon_bead * STEFAN_BOLTZMANN * rad_area * (kelvin(T[bead_idx])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[bead_idx] -= q_rad_bead
-    
-    # --- 2. Heat conduction ---
-    
-    # Table <-> Base plate
-    q_cont = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[1] - T[0])
-    Q_balance[0] += q_cont
-    Q_balance[1] -= q_cont
-    
-    # Base plate <-> Layer 1 (if consolidated layers exist)
-    if num_base_nodes > 2:
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        area_contact = layer_area
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        
-        q_cond_1 = (lam_eff * area_contact / dist) * (T[2] - T[1])
-        Q_balance[1] += q_cond_1
-        Q_balance[2] -= q_cond_1
-    
-    # Layer i <-> Layer i+1 (conduction between consolidated layers)
-    for i in range(2, num_base_nodes - 1):
-        dist = LAYER_HEIGHT
-        area = layer_area
-        
-        q_cond_lay = (LAMBDA_WAAM * area / dist) * (T[i+1] - T[i])
-        Q_balance[i]   += q_cond_lay
-        Q_balance[i+1] -= q_cond_lay
-    
-    # Top consolidated layer <-> First bead (if beads exist and consolidated layers exist)
-    if num_beads > 0 and num_base_nodes > 2:
-        dist = LAYER_HEIGHT  # Center to center
-        # Contact area is the bead's bottom area
-        area_contact = bead_area_first
-        
-        q_cond_to_bead = (LAMBDA_WAAM * area_contact / dist) * (T[num_base_nodes] - T[num_base_nodes - 1])
-        Q_balance[num_base_nodes - 1] += q_cond_to_bead
-        Q_balance[num_base_nodes] -= q_cond_to_bead
-    elif num_beads > 0 and num_base_nodes == 2:
-        # First layer: beads directly on base plate
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        area_contact = bead_area_first
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        
-        q_cond_to_bead = (lam_eff * area_contact / dist) * (T[num_base_nodes] - T[1])
-        Q_balance[1] += q_cond_to_bead
-        Q_balance[num_base_nodes] -= q_cond_to_bead
-    
-    # Bead <-> Adjacent bead (horizontal heat transfer through overlap zone)
-    for i_bead in range(num_beads - 1):
-        bead_idx = num_base_nodes + i_bead
-        next_bead_idx = bead_idx + 1
-        
-        # Conduction through overlap contact area
-        # Distance is approximately the overlap width (center to center in width direction)
-        dist = bead_params['overlap_width']
-        area = bead_contact_area * LAYER_HEIGHT  # Contact area in height direction
-        
-        q_cond_beads = (LAMBDA_WAAM * area / dist) * (T[next_bead_idx] - T[bead_idx])
-        Q_balance[bead_idx] += q_cond_beads
-        Q_balance[next_bead_idx] -= q_cond_beads
-    
-    # Subsequent beads also conduct to layer below through their bottom
-    for i_bead in range(1, num_beads):
-        bead_idx = num_base_nodes + i_bead
-        
-        if num_base_nodes > 2:
-            # Conduct to top consolidated layer
-            dist = LAYER_HEIGHT
-            area_contact = bead_area_subsequent
-            
-            q_cond_down = (LAMBDA_WAAM * area_contact / dist) * (T[bead_idx] - T[num_base_nodes - 1])
-            Q_balance[num_base_nodes - 1] += q_cond_down
-            Q_balance[bead_idx] -= q_cond_down
-        else:
-            # First layer: beads on base plate
-            dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-            area_contact = bead_area_subsequent
-            lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-            
-            q_cond_down = (lam_eff * area_contact / dist) * (T[bead_idx] - T[1])
-            Q_balance[1] += q_cond_down
-            Q_balance[bead_idx] -= q_cond_down
-    
-    # --- 3. Temperature Update (Euler explicit) ---
-    # Table
-    new_T[0] += (Q_balance[0] * DT) / (m_t * CP_TABLE)
-    # BP
-    cp_bp_val = get_cp_bp(T[1])
-    new_T[1] += (Q_balance[1] * DT) / (m_bp * cp_bp_val)
-    # Consolidated layers
-    for i in range(2, num_base_nodes):
-        cp_val = get_cp_waam(T[i])
-        new_T[i] += (Q_balance[i] * DT) / (m_l * cp_val)
-    # Beads
-    for i_bead in range(num_beads):
-        bead_idx = num_base_nodes + i_bead
-        if i_bead == 0:
-            m_bead = m_bead_first
-        else:
-            m_bead = m_bead_subsequent
-        cp_val = get_cp_waam(T[bead_idx])
-        new_T[bead_idx] += (Q_balance[bead_idx] * DT) / (m_bead * cp_val)
-    
-    return new_T
-
-def update_temperatures(T, m_t, m_bp, m_l, layer_area, side_area_layer):
-    """
-    Calculates one time step DT for all nodes.
-    T: List of current temperatures [table, base plate, layer1, layer2, ...]
-    Each layer is tracked individually with heat transfer to adjacent layers.
-    """
-    new_T = T[:]
-    num_nodes = len(T)
-    
-    # Q_dot array initialization (in Watts)
-    # Positive = energy in, Negative = energy out
-    Q_balance = np.zeros(num_nodes)
-    
-    # --- 1. Radiation to environment (Boltzmann) ---
-    # Table (effective surface simplified)
-    area_table_eff = (TABLE_LENGTH * TABLE_WIDTH) - CONTACT_BP_TABLE
-    q_rad_table = EPSILON_TABLE * STEFAN_BOLTZMANN * area_table_eff * (kelvin(T[0])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[0] -= q_rad_table
-    
-    # Base plate (sides + top minus contact area to layer 1)
-    # Simplification: We take effective free area
-    area_bp_total = 2*(BP_LENGTH*BP_WIDTH + BP_LENGTH*BP_THICKNESS + BP_WIDTH*BP_THICKNESS)
-    # Subtract the area covered by layers
-    covered_area = (num_nodes - 2) * layer_area
-    effective_bp_rad_area = area_bp_total - covered_area
-    q_rad_bp = EPSILON_BP * STEFAN_BOLTZMANN * effective_bp_rad_area * (kelvin(T[1])**4 - kelvin(AMBIENT_TEMP)**4)
-    Q_balance[1] -= q_rad_bp
-    
-    # Layer radiation
-    # Each layer radiates over its side surfaces
-    # The top layer additionally radiates over its top surface
-    for i in range(2, num_nodes):
-        rad_area = side_area_layer
-        if i == num_nodes - 1:  # Top layer
-            rad_area += layer_area  # Add top surface area
-        epsilon_layer = get_epsilon_waam(T[i])
-        q_rad_layer = epsilon_layer * STEFAN_BOLTZMANN * rad_area * (kelvin(T[i])**4 - kelvin(AMBIENT_TEMP)**4)
-        Q_balance[i] -= q_rad_layer
-
-    # --- 2. Heat conduction (conduction) ---
-    
-    # Table <-> Base plate
-    # Q = alpha * A * (T_hot - T_cold)
-    q_cont = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[1] - T[0])
-    Q_balance[0] += q_cont # Table gets
-    Q_balance[1] -= q_cont # BP loses
-    
-    # Base plate <-> Layer 1 (Index 2)
-    if num_nodes > 2:
-        # Thermal resistance: R = L / (lambda * A)
-        # Distance approx half plate thickness + half layer height
-        dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-        # Area is contact area of layer
-        area_contact = layer_area
-        # Mean conductivity (harmonic mean or simply mean)
-        lam_eff = (LAMBDA_BP + LAMBDA_WAAM) / 2
-        
-        q_cond_1 = (lam_eff * area_contact / dist) * (T[2] - T[1])
-        Q_balance[1] += q_cond_1
-        Q_balance[2] -= q_cond_1
-        
-    # Layer i <-> Layer i+1 (conduction between adjacent layers)
-    for i in range(2, num_nodes - 1):
-        # i is bottom, i+1 is on top
-        dist = LAYER_HEIGHT # Distance center to center
-        area = layer_area   # Contact area between layers
-        
-        q_cond_lay = (LAMBDA_WAAM * area / dist) * (T[i+1] - T[i])
-        Q_balance[i]   += q_cond_lay
-        Q_balance[i+1] -= q_cond_lay
-        
-    # --- 3. Temperature Update (Euler explicit) ---
-    # dT = (Q_bal * dt) / (m * cp)
-    
-    # Table
-    new_T[0] += (Q_balance[0] * DT) / (m_t * CP_TABLE)
-    # BP
-    cp_bp_val = get_cp_bp(T[1])
-    new_T[1] += (Q_balance[1] * DT) / (m_bp * cp_bp_val)
-    # Layers
-    for i in range(2, num_nodes):
-        cp_val = get_cp_waam(T[i])
-        new_T[i] += (Q_balance[i] * DT) / (m_l * cp_val)
-        
-    return new_T
-
-def log_data(t, temps, t_log, layers_log, bp_log, table_log):
+def log_data(t, node_matrix, t_log, layers_log, bp_log, table_log):
+    """Log temperature data from NodeMatrix."""
     t_log.append(t)
-    # Store all layer temperatures (indices 2 onwards)
-    layer_temps = temps[2:] if len(temps) > 2 else []
+    
+    # Extract layer temperatures (group by layer and take max)
+    top_layer_idx = node_matrix.get_top_layer_idx()
+    layer_temps = []
+    for layer_idx in range(top_layer_idx + 1):
+        nodes_in_layer = node_matrix.get_nodes_in_layer(layer_idx)
+        if nodes_in_layer:
+            max_temp = max(node_matrix.temperatures[i] for i in nodes_in_layer)
+            layer_temps.append(max_temp)
+    
     layers_log.append(layer_temps)
-    bp_log.append(temps[1])
-    table_log.append(temps[0])
+    bp_log.append(node_matrix.temperatures[node_matrix.bp_idx] if node_matrix.bp_idx is not None else AMBIENT_TEMP)
+    table_log.append(node_matrix.temperatures[node_matrix.table_idx] if node_matrix.table_idx is not None else AMBIENT_TEMP)
 
 # =============================================================================
 # EVALUATION & PLOT
