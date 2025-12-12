@@ -20,12 +20,12 @@ LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 3       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_AS_BEADS = 4       # Number of top layers modeled as individual beads (default: 2)
 N_LAYERS_WITH_ELEMENTS = 2  # Number of top layers where beads are subdivided into elements (0 = disabled)
 N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
-NUMBER_OF_LAYERS = 30
+NUMBER_OF_LAYERS = 20
 LAYER_HEIGHT = 0.0024       # [m] (e.g., 2.4mm)
 
 # Track geometry
@@ -40,6 +40,7 @@ MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
 INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
 MODE_1_WAIT_TIME = 30.0     # [s] Only for Mode 1: Forced pause after layer 1
 ARC_POWER = 2270.0          # [W] Total arc power during welding
+ARC_POWER_CURRENT_FRACTION = 0.5  # Fraction of arc power going to current node (0.0-1.0)
 WIRE_FEED_RATE = 0.04       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
 WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 
@@ -204,11 +205,28 @@ class NodeMatrix:
         return [i for i in range(len(self.layer_idx)) 
                 if self.layer_idx[i] == layer_idx and self.level_type[i] != 'special']
     
+    def get_nodes_in_bead(self, layer_idx, bead_idx):
+        """Get all element nodes within a specific bead."""
+        return [i for i in range(len(self.layer_idx))
+                if self.layer_idx[i] == layer_idx and 
+                   self.bead_idx[i] == bead_idx and
+                   self.level_type[i] == 'element']
+    
+    def get_layer_level_type(self, layer_idx):
+        """Get the discretization level type for a specific layer."""
+        for i in range(len(self.layer_idx)):
+            if self.layer_idx[i] == layer_idx and self.level_type[i] != 'special':
+                return self.level_type[i]
+        return None
+    
     def get_vertical_neighbor(self, node_idx, direction):
         """
         Get vertical neighbor (±1 in layer direction).
         direction: +1 for above, -1 for below
         Returns node index or None if not found.
+        
+        For same-level neighbors, returns direct match.
+        For cross-level neighbors, returns None (use get_cross_level_vertical_info instead).
         """
         layer = self.layer_idx[node_idx]
         bead = self.bead_idx[node_idx]
@@ -217,7 +235,11 @@ class NodeMatrix:
         
         target_layer = layer + direction
         
-        # Find matching node in target layer
+        # Special case: going below layer 0 leads to base plate
+        if target_layer < 0:
+            return self.bp_idx
+        
+        # Find matching node in target layer (same level)
         for i in range(len(self.layer_idx)):
             if (self.layer_idx[i] == target_layer and 
                 self.bead_idx[i] == bead and 
@@ -225,11 +247,128 @@ class NodeMatrix:
                 self.level_type[i] == level):
                 return i
         
-        # If exact match not found, try base plate or consolidated layer
-        if target_layer < 0:
-            return self.bp_idx
+        # If layer-level node, check for bead-level layer below/above
+        if level == 'layer':
+            # No direct match found, cross-level will be handled separately
+            return None
         
         return None
+    
+    def get_cross_level_vertical_info(self, node_idx, direction):
+        """
+        Get information for cross-level vertical heat transfer.
+        
+        Returns dict with:
+        - 'type': 'same', 'element_to_bead', 'bead_to_element', 'bead_to_layer', 'layer_to_bead', or 'none'
+        - 'target_nodes': list of node indices in target layer
+        - 'source_nodes': list of node indices that should be aggregated (for mass-weighted avg)
+        - 'target_layer': layer index of target
+        - 'target_level': level type of target layer
+        """
+        layer = self.layer_idx[node_idx]
+        bead = self.bead_idx[node_idx]
+        element = self.element_idx[node_idx]
+        level = self.level_type[node_idx]
+        
+        target_layer = layer + direction
+        
+        # Special case: base plate
+        if target_layer < 0:
+            return {'type': 'to_baseplate', 'target_nodes': [self.bp_idx], 
+                    'source_nodes': [node_idx], 'target_layer': -1, 'target_level': 'special'}
+        
+        # Get target layer's level type
+        target_level = self.get_layer_level_type(target_layer)
+        
+        if target_level is None:
+            return {'type': 'none', 'target_nodes': [], 'source_nodes': [], 
+                    'target_layer': target_layer, 'target_level': None}
+        
+        # Same level - direct transfer
+        if level == target_level:
+            neighbor = self.get_vertical_neighbor(node_idx, direction)
+            if neighbor is not None:
+                return {'type': 'same', 'target_nodes': [neighbor], 
+                        'source_nodes': [node_idx], 'target_layer': target_layer, 
+                        'target_level': target_level}
+            return {'type': 'none', 'target_nodes': [], 'source_nodes': [], 
+                    'target_layer': target_layer, 'target_level': target_level}
+        
+        # Element → Bead (finer to coarser)
+        if level == 'element' and target_level == 'bead':
+            # Find the corresponding bead in target layer
+            target_bead_nodes = [i for i in range(len(self.layer_idx))
+                                 if self.layer_idx[i] == target_layer and 
+                                    self.bead_idx[i] == bead and
+                                    self.level_type[i] == 'bead']
+            # Source: all elements in same bead (for mass-weighted aggregation)
+            source_elements = self.get_nodes_in_bead(layer, bead)
+            return {'type': 'element_to_bead', 'target_nodes': target_bead_nodes,
+                    'source_nodes': source_elements, 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        # Bead → Element (coarser to finer)
+        if level == 'bead' and target_level == 'element':
+            # Find all elements in the corresponding bead of target layer
+            target_elements = self.get_nodes_in_bead(target_layer, bead)
+            return {'type': 'bead_to_element', 'target_nodes': target_elements,
+                    'source_nodes': [node_idx], 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        # Bead → Layer (finer to coarser)
+        if level == 'bead' and target_level == 'layer':
+            # Find layer-level node in target layer
+            target_layer_nodes = [i for i in range(len(self.layer_idx))
+                                  if self.layer_idx[i] == target_layer and 
+                                     self.level_type[i] == 'layer']
+            # Source: all beads in same layer (for mass-weighted aggregation)
+            source_beads = [i for i in range(len(self.layer_idx))
+                           if self.layer_idx[i] == layer and self.level_type[i] == 'bead']
+            return {'type': 'bead_to_layer', 'target_nodes': target_layer_nodes,
+                    'source_nodes': source_beads, 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        # Layer → Bead (coarser to finer)
+        if level == 'layer' and target_level == 'bead':
+            # Find all beads in target layer
+            target_beads = [i for i in range(len(self.layer_idx))
+                           if self.layer_idx[i] == target_layer and self.level_type[i] == 'bead']
+            return {'type': 'layer_to_bead', 'target_nodes': target_beads,
+                    'source_nodes': [node_idx], 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        # Element → Layer (skip bead level)
+        if level == 'element' and target_level == 'layer':
+            target_layer_nodes = [i for i in range(len(self.layer_idx))
+                                  if self.layer_idx[i] == target_layer and 
+                                     self.level_type[i] == 'layer']
+            # All elements in the layer
+            source_elements = [i for i in range(len(self.layer_idx))
+                              if self.layer_idx[i] == layer and self.level_type[i] == 'element']
+            return {'type': 'element_to_layer', 'target_nodes': target_layer_nodes,
+                    'source_nodes': source_elements, 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        # Layer → Element (skip bead level)
+        if level == 'layer' and target_level == 'element':
+            target_elements = [i for i in range(len(self.layer_idx))
+                              if self.layer_idx[i] == target_layer and self.level_type[i] == 'element']
+            return {'type': 'layer_to_element', 'target_nodes': target_elements,
+                    'source_nodes': [node_idx], 'target_layer': target_layer,
+                    'target_level': target_level}
+        
+        return {'type': 'none', 'target_nodes': [], 'source_nodes': [], 
+                'target_layer': target_layer, 'target_level': target_level}
+    
+    def compute_mass_weighted_temperature(self, node_indices, temperatures):
+        """Compute mass-weighted average temperature for a list of nodes."""
+        if not node_indices:
+            return 0.0
+        total_mass = sum(self.masses[i] for i in node_indices)
+        if total_mass == 0:
+            return temperatures[node_indices[0]] if node_indices else 0.0
+        weighted_sum = sum(self.masses[i] * temperatures[i] for i in node_indices)
+        return weighted_sum / total_mass
     
     def get_horizontal_neighbor(self, node_idx, direction):
         """
@@ -283,11 +422,58 @@ class NodeMatrix:
         
         return None
     
+    def get_beads_in_layer(self, layer_idx):
+        """Get list of unique bead indices in a layer."""
+        beads = set()
+        for i in range(len(self.layer_idx)):
+            if self.layer_idx[i] == layer_idx and self.bead_idx[i] >= 0:
+                beads.add(self.bead_idx[i])
+        return sorted(list(beads))
+    
+    def get_elements_in_bead(self, layer_idx, bead_idx):
+        """Get list of element indices in a specific bead."""
+        elements = set()
+        for i in range(len(self.layer_idx)):
+            if (self.layer_idx[i] == layer_idx and 
+                self.bead_idx[i] == bead_idx and 
+                self.element_idx[i] >= 0):
+                elements.add(self.element_idx[i])
+        return sorted(list(elements))
+    
+    def get_elements_placed_in_bead(self, layer_idx, bead_idx):
+        """Get the number of elements already placed in a specific bead position."""
+        return len(self.get_elements_in_bead(layer_idx, bead_idx))
+    
+    def get_max_bead_in_layer(self, layer_idx):
+        """Get the maximum bead index currently existing in a layer."""
+        max_bead = -1
+        for i in range(len(self.layer_idx)):
+            if self.layer_idx[i] == layer_idx and self.bead_idx[i] > max_bead:
+                max_bead = self.bead_idx[i]
+        return max_bead
+    
+    def get_max_element_in_bead(self, layer_idx, bead_idx):
+        """Get the maximum element index currently existing in a bead."""
+        max_elem = -1
+        for i in range(len(self.layer_idx)):
+            if (self.layer_idx[i] == layer_idx and 
+                self.bead_idx[i] == bead_idx and 
+                self.element_idx[i] > max_elem):
+                max_elem = self.element_idx[i]
+        return max_elem
+    
     def compute_radiation_area(self, node_idx, top_layer_idx):
         """
         Compute radiation area for a node based on its position in the matrix.
-        Uses the logic: only top layer radiates with top surface, 
-        layer-level radiates full side, bead-level considers position.
+        
+        Logic:
+        - Layer-level: Side surfaces always, top surface only if top layer
+        - Bead-level: First/last bead radiates long side + both short sides,
+                      inner beads radiate only short sides.
+                      In top layer: check for missing neighbors and radiate exposed faces.
+        - Element-level: First/last element in bead radiates broad side,
+                        first/last bead radiates long side (proportional).
+                        In top layer: check for missing neighbors.
         """
         layer = self.layer_idx[node_idx]
         bead = self.bead_idx[node_idx]
@@ -300,58 +486,183 @@ class NodeMatrix:
         rad_area = 0.0
         is_top = (layer == top_layer_idx)
         
+        # Calculate geometry parameters
+        effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
+        
         if level == 'layer':
-            # Consolidated layer: side surfaces only
+            # Layer-level: always side surfaces, top only if top layer
+            layer_area = effective_layer_width * TRACK_LENGTH
+            side_area = 2 * (TRACK_LENGTH + effective_layer_width) * LAYER_HEIGHT
+            
             if is_top:
-                rad_area += self.areas[node_idx]  # Top surface
-            rad_area += 2 * (TRACK_LENGTH * NUMBER_OF_TRACKS * (1 - TRACK_OVERLAP) + 
-                            TRACK_LENGTH) * LAYER_HEIGHT  # Simplified side area
+                rad_area += layer_area  # Top surface
+            rad_area += side_area  # All side surfaces
             
         elif level == 'bead':
-            # Bead-level consideration
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_top_area = bead_width * TRACK_LENGTH
             
-            # Top surface (only if top layer)
+            # Get current bead count and max bead in this layer
+            beads_in_layer = self.get_beads_in_layer(layer)
+            max_bead = max(beads_in_layer) if beads_in_layer else 0
+            min_bead = min(beads_in_layer) if beads_in_layer else 0
+            
+            # Top surface: only if top layer
             if is_top:
-                rad_area += self.areas[node_idx]
+                rad_area += bead_top_area
             
-            # Count beads in this layer
-            beads_in_layer = sum(1 for i in range(len(self.layer_idx)) 
-                                if self.layer_idx[i] == layer and self.bead_idx[i] >= 0)
+            # Side surfaces:
+            # Long sides (parallel to track, perpendicular to bead direction)
+            if bead == min_bead:
+                # First bead: radiates left long side
+                rad_area += TRACK_LENGTH * LAYER_HEIGHT
+            if bead == max_bead:
+                # Last bead: radiates right long side
+                rad_area += TRACK_LENGTH * LAYER_HEIGHT
             
-            # Side surfaces based on position
-            if beads_in_layer == 1:
-                # Only bead: all sides
-                rad_area += 2 * TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-            elif bead == 0 or bead == beads_in_layer - 1:
-                # First or last bead: one long side + short sides
-                rad_area += TRACK_LENGTH * LAYER_HEIGHT + 2 * bead_width * LAYER_HEIGHT
-            else:
-                # Inner bead: only short sides
-                rad_area += 2 * bead_width * LAYER_HEIGHT
+            # Short sides (perpendicular to track, at start/end of track)
+            # Both short sides always radiate for all beads
+            rad_area += 2 * bead_width * LAYER_HEIGHT
+            
+            # In top layer: check for missing horizontal neighbors
+            if is_top:
+                # Check left neighbor (bead - 1)
+                if bead > 0:
+                    h_left = self.get_horizontal_neighbor(node_idx, -1)
+                    if h_left is None:
+                        # No left neighbor exists yet -> radiate that face
+                        rad_area += TRACK_LENGTH * LAYER_HEIGHT
+                # Check right neighbor (bead + 1)
+                h_right = self.get_horizontal_neighbor(node_idx, +1)
+                if h_right is None and bead < NUMBER_OF_TRACKS - 1:
+                    # Right neighbor doesn't exist yet -> radiate that face
+                    rad_area += TRACK_LENGTH * LAYER_HEIGHT
         
         elif level == 'element':
-            # Element-level consideration
             element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            element_top_area = element_length * bead_width
             
-            # Top surface (only if top layer)
+            # Get current element/bead counts
+            beads_in_layer = self.get_beads_in_layer(layer)
+            max_bead = max(beads_in_layer) if beads_in_layer else 0
+            min_bead = min(beads_in_layer) if beads_in_layer else 0
+            
+            max_element = self.get_max_element_in_bead(layer, bead)
+            
+            # Top surface: only if top layer
             if is_top:
-                rad_area += element_length * bead_width
+                rad_area += element_top_area
             
-            # Count elements and beads
-            beads_in_layer = sum(1 for i in range(len(self.layer_idx)) 
-                                if self.layer_idx[i] == layer and self.bead_idx[i] >= 0)
-            
-            # Broad side (perpendicular to track direction)
-            if element == 0 or element == N_ELEMENTS_PER_BEAD - 1:
-                # First or last element: has broad side exposed
+            # Broad sides (perpendicular to track direction, at element start/end)
+            # First element in bead: radiates start face
+            if element == 0:
+                rad_area += bead_width * LAYER_HEIGHT
+            # Last element in bead: radiates end face
+            if element == max_element:
                 rad_area += bead_width * LAYER_HEIGHT
             
             # Long sides (parallel to track direction)
-            if bead == 0 or bead == beads_in_layer - 1:
-                # First or last bead: element has fraction of long side exposed
+            # First bead: elements radiate left long side
+            if bead == min_bead:
                 rad_area += element_length * LAYER_HEIGHT
+            # Last bead: elements radiate right long side
+            if bead == max_bead:
+                rad_area += element_length * LAYER_HEIGHT
+            
+            # In top layer: check for missing neighbors
+            if is_top:
+                # Check horizontal neighbor (left/right bead)
+                if bead > 0:
+                    h_left = self.get_horizontal_neighbor(node_idx, -1)
+                    if h_left is None:
+                        rad_area += element_length * LAYER_HEIGHT
+                if bead < NUMBER_OF_TRACKS - 1:
+                    h_right = self.get_horizontal_neighbor(node_idx, +1)
+                    if h_right is None:
+                        rad_area += element_length * LAYER_HEIGHT
+                
+                # Check longitudinal neighbor (along track)
+                if element > 0:
+                    l_back = self.get_longitudinal_neighbor(node_idx, -1)
+                    if l_back is None:
+                        rad_area += bead_width * LAYER_HEIGHT
+                if element < N_ELEMENTS_PER_BEAD - 1:
+                    l_forward = self.get_longitudinal_neighbor(node_idx, +1)
+                    if l_forward is None:
+                        rad_area += bead_width * LAYER_HEIGHT
+        
+        return rad_area
+    
+    def compute_bp_radiation_area(self, top_layer_idx):
+        """
+        Compute base plate radiation area.
+        
+        - If no layers yet: full BP surface
+        - Layer 0 (first layer): BP top surface minus currently covered area by beads/elements
+        - Layer >= 1: BP bottom + 4 sides (top is fully covered)
+        """
+        if top_layer_idx < 0:
+            # No layers yet: full BP surface
+            return (2 * BP_LENGTH * BP_WIDTH + 
+                    2 * BP_LENGTH * BP_THICKNESS + 
+                    2 * BP_WIDTH * BP_THICKNESS)
+        
+        # Calculate covered area on BP (by first layer nodes)
+        first_layer_nodes = self.get_nodes_in_layer(0)
+        covered_area = sum(self.areas[i] for i in first_layer_nodes)
+        
+        if top_layer_idx == 0:
+            # Only first layer exists: BP radiates uncovered top + sides
+            bp_top_uncovered = max(0, BP_LENGTH * BP_WIDTH - covered_area)
+            bp_sides = 2 * BP_LENGTH * BP_THICKNESS + 2 * BP_WIDTH * BP_THICKNESS
+            # Bottom is on table, doesn't radiate
+            return bp_top_uncovered + bp_sides
+        else:
+            # Layer >= 1: BP top is fully covered, radiate sides only
+            # (Bottom is on table)
+            bp_sides = 2 * BP_LENGTH * BP_THICKNESS + 2 * BP_WIDTH * BP_THICKNESS
+            return bp_sides
+    
+    def compute_table_radiation_area(self):
+        """
+        Compute table radiation area.
+        Table radiates with full surface minus BP contact area.
+        """
+        table_total = (2 * TABLE_LENGTH * TABLE_WIDTH + 
+                       2 * TABLE_LENGTH * TABLE_THICKNESS + 
+                       2 * TABLE_WIDTH * TABLE_THICKNESS)
+        # Subtract BP bottom (contact area)
+        return table_total - CONTACT_BP_TABLE
+    
+    def compute_previous_layer_uncovered_top(self, layer_idx, current_bead_idx, current_element_idx):
+        """
+        Compute the uncovered top area of the layer below that should still radiate.
+        
+        This is needed when building on a coarser discretization level.
+        Returns the area of the previous layer's top that is not yet covered
+        by the current layer's beads/elements.
+        """
+        if layer_idx <= 0:
+            return 0.0
+        
+        prev_layer = layer_idx - 1
+        prev_level = self.get_layer_level_type(prev_layer)
+        curr_level = self.get_layer_level_type(layer_idx)
+        
+        if prev_level is None:
+            return 0.0
+        
+        # Calculate what's covered by current layer's existing nodes
+        current_layer_nodes = self.get_nodes_in_layer(layer_idx)
+        current_covered = sum(self.areas[i] for i in current_layer_nodes)
+        
+        # Calculate total top area of previous layer
+        prev_layer_nodes = self.get_nodes_in_layer(prev_layer)
+        prev_total_top = sum(self.areas[i] for i in prev_layer_nodes)
+        
+        # Uncovered area
+        return max(0.0, prev_total_top - current_covered)
         
         return rad_area
     
@@ -421,47 +732,140 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
     
     # --- Arc power during welding ---
     if is_welding and arc_power > 0 and welding_node_idx is not None:
-        # Distribute arc power: 50% to current, 25% to horizontal neighbor, 25% to vertical neighbor
-        Q_balance[welding_node_idx] += 0.5 * arc_power
+        # ARC_POWER_CURRENT_FRACTION to current node
+        current_power = ARC_POWER_CURRENT_FRACTION * arc_power
+        Q_balance[welding_node_idx] += current_power
+        
+        # Collect neighbors for the remaining power
+        neighbors = []
+        contact_areas = []
+        
+        remaining_power = (1.0 - ARC_POWER_CURRENT_FRACTION) * arc_power
         
         # Horizontal neighbor (previous bead in same layer)
         h_neighbor = node_matrix.get_horizontal_neighbor(welding_node_idx, -1)
         if h_neighbor is not None:
-            Q_balance[h_neighbor] += 0.25 * arc_power
-            # Vertical neighbor gets remaining 25%
-            v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
-            if v_neighbor is not None:
-                Q_balance[v_neighbor] += 0.25 * arc_power
+            neighbors.append(h_neighbor)
+            # Contact area for horizontal: overlap_width * TRACK_LENGTH
+            contact_areas.append(TRACK_WIDTH * TRACK_OVERLAP * TRACK_LENGTH)
+        
+        # Vertical neighbor (layer below)
+        v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
+        if v_neighbor is not None:
+            neighbors.append(v_neighbor)
+            # Contact area for vertical: top area of the vertical neighbor
+            contact_areas.append(node_matrix.areas[v_neighbor])
+        elif node_matrix.bp_idx is not None:
+            # If no vertical neighbor, use base plate
+            neighbors.append(node_matrix.bp_idx)
+            # Contact area for BP: top area of current node
+            contact_areas.append(node_matrix.areas[welding_node_idx])
+        
+        # Special case: if this is the first node in the layer (bead_idx == 0 and no horizontal neighbor)
+        is_first_node = (node_matrix.bead_idx[welding_node_idx] == 0 and 
+                        node_matrix.get_horizontal_neighbor(welding_node_idx, -1) is None)
+        
+        if is_first_node and node_matrix.bp_idx in neighbors:
+            # First node: entire remaining power goes to BP
+            bp_idx = neighbors.index(node_matrix.bp_idx)
+            Q_balance[node_matrix.bp_idx] += remaining_power
+        elif neighbors:
+            # Distribute remaining power among neighbors proportional to contact areas
+            total_contact_area = sum(contact_areas)
+            if total_contact_area > 0:
+                for i, neighbor_idx in enumerate(neighbors):
+                    fraction = contact_areas[i] / total_contact_area
+                    Q_balance[neighbor_idx] += remaining_power * fraction
             else:
-                Q_balance[node_matrix.bp_idx] += 0.25 * arc_power
-        else:
-            # No horizontal neighbor: 75% to current, 25% to vertical
-            Q_balance[welding_node_idx] += 0.25 * arc_power
-            v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
-            if v_neighbor is not None:
-                Q_balance[v_neighbor] += 0.25 * arc_power
-            else:
-                Q_balance[node_matrix.bp_idx] += 0.25 * arc_power
+                # If all contact areas are 0, distribute equally
+                equal_share = remaining_power / len(neighbors)
+                for neighbor_idx in neighbors:
+                    Q_balance[neighbor_idx] += equal_share
     
     # --- Radiation ---
     T_K4 = (T + 273.15)**4
     T_amb_K4 = (AMBIENT_TEMP + 273.15)**4
     top_layer_idx = node_matrix.get_top_layer_idx()
     
-    # Table radiation
+    # Table radiation (full surface minus BP contact area)
     if node_matrix.table_idx is not None:
+        table_rad_area = node_matrix.compute_table_radiation_area()
         Q_balance[node_matrix.table_idx] -= (EPSILON_TABLE * STEFAN_BOLTZMANN * 
-                                              model.area_table_rad * 
+                                              table_rad_area * 
                                               (T_K4[node_matrix.table_idx] - T_amb_K4))
     
-    # Base plate radiation (calculate exposed area)
+    # Base plate radiation (using new method that considers layer coverage)
     if node_matrix.bp_idx is not None:
-        covered_area = sum(node_matrix.areas[i] for i in range(num_nodes) 
-                          if node_matrix.level_type[i] != 'special')
-        eff_bp_area = max(0, model.area_bp_total - covered_area)
+        bp_rad_area = node_matrix.compute_bp_radiation_area(top_layer_idx)
         Q_balance[node_matrix.bp_idx] -= (EPSILON_BP * STEFAN_BOLTZMANN * 
-                                          eff_bp_area * 
+                                          bp_rad_area * 
                                           (T_K4[node_matrix.bp_idx] - T_amb_K4))
+    
+    # Previous layer uncovered top radiation (when current layer partially covers it)
+    # This handles the case where beads/elements are being deposited and 
+    # the previous layer's uncovered portions still radiate
+    if top_layer_idx > 0:
+        prev_layer_idx = top_layer_idx - 1
+        prev_level = node_matrix.get_layer_level_type(prev_layer_idx)
+        
+        if prev_level == 'bead' or prev_level == 'element':
+            # For bead/element level in previous layer, check each node individually
+            prev_layer_nodes = node_matrix.get_nodes_in_layer(prev_layer_idx)
+            
+            for i in prev_layer_nodes:
+                # Check if this node has a vertical neighbor above
+                v_neighbor = node_matrix.get_vertical_neighbor(i, +1)
+                
+                if v_neighbor is None:
+                    # No vertical neighbor above, so this node radiates its top surface
+                    rad_area = 0.0
+                    
+                    if node_matrix.level_type[i] == 'bead':
+                        # Bead top area
+                        bead_width = TRACK_WIDTH if node_matrix.bead_idx[i] == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+                        bead_top_area = bead_width * TRACK_LENGTH
+                        
+                        # Special case: if N_LAYERS_WITH_ELEMENTS == 1 and previous layer is bead level
+                        # Subtract the top areas of already placed elements on this bead
+                        if N_LAYERS_WITH_ELEMENTS == 1 and prev_level == 'bead':
+                            elements_placed = node_matrix.get_elements_placed_in_bead(prev_layer_idx, node_matrix.bead_idx[i])
+                            element_top_area = (TRACK_LENGTH / N_ELEMENTS_PER_BEAD) * bead_width
+                            covered_by_elements = elements_placed * element_top_area
+                            rad_area = max(0.0, bead_top_area - covered_by_elements)
+                        else:
+                            rad_area = bead_top_area
+                    
+                    elif node_matrix.level_type[i] == 'element':
+                        # Element top area
+                        element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
+                        bead_width = TRACK_WIDTH if node_matrix.bead_idx[i] == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+                        rad_area = element_length * bead_width
+                    
+                    elif node_matrix.level_type[i] == 'layer':
+                        # Layer top area
+                        effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
+                        rad_area = effective_layer_width * TRACK_LENGTH
+                    
+                    if rad_area > 0:
+                        epsilon = get_epsilon_waam(T[i])
+                        Q_balance[i] -= epsilon * STEFAN_BOLTZMANN * rad_area * (T_K4[i] - T_amb_K4)
+        
+        elif prev_level == 'layer':
+            # For layer level, use the old logic (full uncovered area)
+            prev_layer_nodes = node_matrix.get_nodes_in_layer(prev_layer_idx)
+            if prev_layer_nodes:
+                current_layer_nodes = node_matrix.get_nodes_in_layer(top_layer_idx)
+                current_covered = sum(node_matrix.areas[i] for i in current_layer_nodes)
+                prev_total_top = sum(node_matrix.areas[i] for i in prev_layer_nodes)
+                uncovered_top = max(0.0, prev_total_top - current_covered)
+                
+                if uncovered_top > 0:
+                    # Distribute uncovered radiation among previous layer nodes proportionally
+                    for i in prev_layer_nodes:
+                        node_fraction = node_matrix.areas[i] / prev_total_top if prev_total_top > 0 else 0
+                        node_uncovered = uncovered_top * node_fraction
+                        epsilon = get_epsilon_waam(T[i])
+                        Q_balance[i] -= epsilon * STEFAN_BOLTZMANN * node_uncovered * (T_K4[i] - T_amb_K4)
     
     # WAAM nodes radiation (using matrix logic)
     for i in range(num_nodes):
@@ -479,26 +883,97 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
         Q_balance[node_matrix.table_idx] += q_contact
         Q_balance[node_matrix.bp_idx] -= q_contact
     
-    # Conduction between all nodes (using neighbor finding)
-    for i in range(num_nodes):
-        if node_matrix.level_type[i] == 'special' and i != node_matrix.bp_idx:
-            continue
+    # Conduction between all nodes (using neighbor finding with cross-level support)
+    processed_pairs = set()  # Track processed node pairs to avoid double counting
+    
+    # Special case: Base plate to first layer (possibly multi-level)
+    if node_matrix.bp_idx is not None:
+        bp_idx = node_matrix.bp_idx
+        first_layer_nodes = node_matrix.get_nodes_in_layer(0)
         
-        # Vertical conduction (upward)
-        v_up = node_matrix.get_vertical_neighbor(i, +1)
-        if v_up is not None:
-            # Determine distance and thermal conductivity
-            if i == node_matrix.bp_idx:
-                dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
-                lam = (LAMBDA_BP + LAMBDA_WAAM) / 2
-            else:
-                dist = LAYER_HEIGHT
-                lam = LAMBDA_WAAM
+        if first_layer_nodes:
+            # Distance from BP center to first layer center
+            dist = (BP_THICKNESS / 2) + (LAYER_HEIGHT / 2)
+            lam = (LAMBDA_BP + LAMBDA_WAAM) / 2
+            
+            for target_idx in first_layer_nodes:
+                pair_key = (min(bp_idx, target_idx), max(bp_idx, target_idx))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+                
+                area = node_matrix.areas[target_idx]  # Use WAAM node's area
+                q_vert = lam * area / dist * (T[target_idx] - T[bp_idx])
+                Q_balance[bp_idx] += q_vert
+                Q_balance[target_idx] -= q_vert
+    
+    for i in range(num_nodes):
+        if node_matrix.level_type[i] == 'special':
+            continue  # BP already handled above
+        
+        # Vertical conduction (upward) with cross-level support
+        cross_info = node_matrix.get_cross_level_vertical_info(i, +1)
+        transfer_type = cross_info['type']
+        
+        if transfer_type == 'to_baseplate':
+            # Already handled in BP section above
+            continue
+        elif transfer_type == 'none' or transfer_type is None:
+            # No vertical neighbor (top layer)
+            continue
+        elif transfer_type == 'same':
+            # Same discretization level - direct transfer
+            v_up = cross_info['target_nodes'][0]
+            pair_key = (min(i, v_up), max(i, v_up))
+            if pair_key in processed_pairs:
+                continue
+            processed_pairs.add(pair_key)
+            
+            dist = LAYER_HEIGHT
+            lam = LAMBDA_WAAM
             
             area = node_matrix.areas[v_up]
             q_vert = lam * area / dist * (T[v_up] - T[i])
             Q_balance[i] += q_vert
             Q_balance[v_up] -= q_vert
+            
+        elif transfer_type in ['element_to_bead', 'bead_to_layer', 'element_to_layer']:
+            # Finer -> Coarser: Multiple source nodes contribute to one target
+            target_nodes = cross_info['target_nodes']
+            
+            if not target_nodes:
+                continue
+                
+            target_idx = target_nodes[0]
+            
+            # For finer to coarser, compute heat from this source only
+            dist = LAYER_HEIGHT
+            lam = LAMBDA_WAAM
+            area = node_matrix.areas[i]  # Use source node's area
+            q_vert = lam * area / dist * (T[target_idx] - T[i])
+            Q_balance[i] += q_vert
+            Q_balance[target_idx] -= q_vert
+            
+        elif transfer_type in ['bead_to_element', 'layer_to_bead', 'layer_to_element']:
+            # Coarser -> Finer: One source distributes to multiple targets
+            target_nodes = cross_info['target_nodes']
+            
+            if not target_nodes:
+                continue
+            
+            # Process each target (finer node)
+            for target_idx in target_nodes:
+                pair_key = (min(i, target_idx), max(i, target_idx))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+                
+                dist = LAYER_HEIGHT
+                lam = LAMBDA_WAAM
+                area = node_matrix.areas[target_idx]  # Use target (finer) node's area
+                q_vert = lam * area / dist * (T[target_idx] - T[i])
+                Q_balance[i] += q_vert
+                Q_balance[target_idx] -= q_vert
         
         # Horizontal conduction (rightward - to avoid double counting)
         h_right = node_matrix.get_horizontal_neighbor(i, +1)
@@ -597,6 +1072,9 @@ def run_simulation():
     if N_ELEMENTS_PER_BEAD <= 0:
         raise ValueError(f"N_ELEMENTS_PER_BEAD ({N_ELEMENTS_PER_BEAD}) must be > 0")
     
+    if not (0.0 <= ARC_POWER_CURRENT_FRACTION <= 1.0):
+        raise ValueError(f"ARC_POWER_CURRENT_FRACTION ({ARC_POWER_CURRENT_FRACTION}) must be between 0.0 and 1.0")
+    
     if DT <= 0:
         raise ValueError(f"DT ({DT}) must be > 0")
     
@@ -692,10 +1170,15 @@ def run_simulation():
     # Main simulation loop
     for i_layer in tqdm(range(NUMBER_OF_LAYERS)):
         
-        # Determine discretization level for this layer
-        layers_from_top = NUMBER_OF_LAYERS - i_layer - 1
-        use_beads = layers_from_top < N_LAYERS_AS_BEADS
-        use_elements = layers_from_top < N_LAYERS_WITH_ELEMENTS
+        # Dynamic discretization: based on current number of layers (i_layer + 1)
+        # The current layer being deposited is always the "top" layer
+        # use_beads: True if current layer should use bead-level (always for top N_LAYERS_AS_BEADS)
+        # use_elements: True if current layer should use element-level (always for top N_LAYERS_WITH_ELEMENTS)
+        current_num_layers = i_layer + 1  # Total layers including this one
+        
+        # Current layer is always the topmost, so it always uses the finest discretization
+        use_beads = N_LAYERS_AS_BEADS >= 1  # Current layer uses beads if N_LAYERS_AS_BEADS >= 1
+        use_elements = N_LAYERS_WITH_ELEMENTS >= 1  # Current layer uses elements if N_LAYERS_WITH_ELEMENTS >= 1
         
         if use_beads:
             # Bead-level or element-level discretization
@@ -799,16 +1282,73 @@ def run_simulation():
         
         wait_times.append(current_time - time_start_wait)
         
-        # Consolidate old layers (beyond N_LAYERS_AS_BEADS) to layer-level
-        layers_to_consolidate = i_layer - N_LAYERS_AS_BEADS + 1
-        if layers_to_consolidate > 0:
-            for layer_to_consolidate in range(layers_to_consolidate):
-                nodes_in_layer = node_matrix.get_nodes_in_layer(layer_to_consolidate)
+        # Dynamic consolidation based on current layer count
+        # Elements → Beads: for layers beyond N_LAYERS_WITH_ELEMENTS from top
+        # Beads → Layer: for layers beyond N_LAYERS_AS_BEADS from top
+        
+        current_num_layers = i_layer + 1
+        
+        # Consolidate elements to beads for layers that should now be bead-level only
+        if N_LAYERS_WITH_ELEMENTS > 0:
+            for layer_idx in range(current_num_layers):
+                layers_from_current_top = current_num_layers - layer_idx - 1
+                should_be_elements = layers_from_current_top < N_LAYERS_WITH_ELEMENTS
+                
+                if not should_be_elements:
+                    # This layer should NOT have elements anymore, consolidate to beads
+                    current_level = node_matrix.get_layer_level_type(layer_idx)
+                    if current_level == 'element':
+                        # Get all beads that have elements
+                        beads_in_layer = node_matrix.get_beads_in_layer(layer_idx)
+                        for bead_idx in beads_in_layer:
+                            element_nodes = node_matrix.get_nodes_in_bead(layer_idx, bead_idx)
+                            if len(element_nodes) > 0:
+                                # Consolidate elements into single bead
+                                total_mass = sum(node_matrix.masses[i] for i in element_nodes)
+                                weighted_temp = sum(node_matrix.masses[i] * node_matrix.temperatures[i] 
+                                                   for i in element_nodes) / total_mass if total_mass > 0 else AMBIENT_TEMP
+                                
+                                bead_area = bead_area_first if bead_idx == 0 else bead_area_subsequent
+                                bead_mass = m_bead_first if bead_idx == 0 else m_bead_subsequent
+                                
+                                # Remove element nodes (in reverse to preserve indices)
+                                for idx in sorted(element_nodes, reverse=True):
+                                    del node_matrix.layer_idx[idx]
+                                    del node_matrix.bead_idx[idx]
+                                    del node_matrix.element_idx[idx]
+                                    del node_matrix.level_type[idx]
+                                    del node_matrix.masses[idx]
+                                    del node_matrix.areas[idx]
+                                    del node_matrix.temperatures[idx]
+                                
+                                # Update special indices after deletion
+                                if node_matrix.table_idx is not None:
+                                    node_matrix.table_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
+                                                                  if lt == 'special' and node_matrix.layer_idx[i] == -2), None)
+                                if node_matrix.bp_idx is not None:
+                                    node_matrix.bp_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
+                                                               if lt == 'special' and node_matrix.layer_idx[i] == -1), None)
+                                
+                                # Add consolidated bead node
+                                node_matrix.add_node(
+                                    layer_idx=layer_idx, bead_idx=bead_idx, element_idx=-1,
+                                    level_type='bead', mass=bead_mass, area=bead_area,
+                                    temperature=weighted_temp
+                                )
+        
+        # Consolidate beads to layer for layers that should now be layer-level
+        for layer_idx in range(current_num_layers):
+            layers_from_current_top = current_num_layers - layer_idx - 1
+            should_be_beads = layers_from_current_top < N_LAYERS_AS_BEADS
+            
+            if not should_be_beads:
+                # This layer should NOT have beads anymore, consolidate to layer
+                nodes_in_layer = node_matrix.get_nodes_in_layer(layer_idx)
                 if len(nodes_in_layer) > 1:
                     # Consolidate multiple nodes into one layer-level node
                     total_mass = sum(node_matrix.masses[i] for i in nodes_in_layer)
                     weighted_temp = sum(node_matrix.masses[i] * node_matrix.temperatures[i] 
-                                       for i in nodes_in_layer) / total_mass
+                                       for i in nodes_in_layer) / total_mass if total_mass > 0 else AMBIENT_TEMP
                     
                     # Remove old nodes (in reverse to preserve indices)
                     for idx in sorted(nodes_in_layer, reverse=True):
@@ -820,9 +1360,17 @@ def run_simulation():
                         del node_matrix.areas[idx]
                         del node_matrix.temperatures[idx]
                     
+                    # Update special indices after deletion
+                    if node_matrix.table_idx is not None:
+                        node_matrix.table_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
+                                                      if lt == 'special' and node_matrix.layer_idx[i] == -2), None)
+                    if node_matrix.bp_idx is not None:
+                        node_matrix.bp_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
+                                                   if lt == 'special' and node_matrix.layer_idx[i] == -1), None)
+                    
                     # Add consolidated layer node
                     node_matrix.add_node(
-                        layer_idx=layer_to_consolidate, bead_idx=-1, element_idx=-1,
+                        layer_idx=layer_idx, bead_idx=-1, element_idx=-1,
                         level_type='layer', mass=m_layer, area=layer_area,
                         temperature=weighted_temp
                     )
