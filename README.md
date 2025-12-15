@@ -47,6 +47,40 @@ The script will:
 3. Display results in the console, including fitted robot parameters
 4. Generate plots showing temperature profiles and wait times
 
+### Node Temperature Logging and 3D Visualization
+
+For detailed analysis, you can log all node temperatures at each timestep and visualize them in 3D:
+
+#### Step 1: Run simulation with detailed logging
+
+```bash
+python log_node_temperatures.py --output node_temps.h5 --layers 5
+```
+
+Options:
+- `--output, -o`: Output HDF5 file path (default: `node_temperatures.h5`)
+- `--layers, -l`: Number of layers to simulate (default: uses `NUMBER_OF_LAYERS` from config)
+
+#### Step 2: Visualize in 3D
+
+```bash
+python visualize_nodes.py --file node_temps.h5
+```
+
+Options:
+- `--file, -f`: Input HDF5 file (default: `node_temperatures.h5`)
+- `--colormap, -c`: Color scheme for temperature (default: `hot`). Options: `hot`, `jet`, `viridis`, `plasma`, etc.
+- `--temp-min`: Minimum temperature for color scale (default: auto)
+- `--temp-max`: Maximum temperature for color scale (default: auto)
+- `--backend`: Visualization library (`plotly`, `matplotlib`, or `auto`)
+
+The visualization shows:
+- Each thermal node as a 3D block at its physical position
+- Color-coded temperature (blue=cold, red=hot)
+- Interactive slider to navigate through timesteps
+- Hover tooltips with node details (Plotly backend)
+- Play/Pause animation button
+
 ### Configuration
 
 Modify the input parameters at the top of `Thermal_Sim.py` to adjust:
@@ -199,6 +233,25 @@ This approach ensures that the simulation can handle large builds (30+ layers) w
   - Temperature vs. time for all components (showing bead-level detail)
   - Welding table temperature shows maximum (hotspot) rather than average
   - Wait time per layer with linear/cubic fit
+- **HDF5 Data Files** (from `log_node_temperatures.py`):
+  - Timestep arrays
+  - Node metadata (positions, dimensions, types)
+  - Full temperature history for all nodes
+- **Interactive 3D Visualization** (from `visualize_nodes.py`):
+  - HTML file with Plotly visualization (if using Plotly backend)
+  - Matplotlib window with slider controls
+
+## Project Structure
+
+```
+WAAM_interlayer_time_sim/
+├── Thermal_Sim.py           # Main simulation script
+├── log_node_temperatures.py  # Detailed node temperature logging
+├── visualize_nodes.py        # 3D visualization with timestep slider
+├── requirements.txt          # Python dependencies
+├── README.md                 # This documentation
+└── LICENSE                   # License file
+```
 
 ## Limitations
 

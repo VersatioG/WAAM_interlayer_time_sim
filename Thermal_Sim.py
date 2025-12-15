@@ -29,7 +29,7 @@ LAYER_HEIGHT = 0.0024       # [m] (e.g., 2.4mm)
 
 # Track geometry
 TRACK_WIDTH = 0.0043         # [m] Width of a single weld track (bead width)
-TRACK_OVERLAP = 0.738        # Venter distance in percent of track width (e.g., 73.8% overlap)
+TRACK_OVERLAP = 0.738        # Center distance in percent of track width (e.g., 73.8% overlap)
 NUMBER_OF_TRACKS = 5        # Number of parallel tracks per layer
 TRACK_LENGTH = 0.1         # [m] Length of each track
 
@@ -88,7 +88,7 @@ EPSILON_TABLE = 0.7        # Emissivity
 #   Mode 2+: Each higher mode adds +1 to each dimension subdivision
 # The base plate is placed on one of the top corner nodes.
 # Validation: Each table node in X/Y direction must be >= BP dimensions
-TABLE_DISCRETIZATION_MODE = 4   # 0 = single node, 1+ = subdivided
+TABLE_DISCRETIZATION_MODE = 2   # 0 = single node, 1+ = subdivided
 N_TABLE_X = 3               # Base subdivisions along length (X) for Mode 1
 N_TABLE_Y = 2               # Base subdivisions along width (Y) for Mode 1
 N_TABLE_Z = 2               # Base subdivisions along thickness (Z) for Mode 1
