@@ -9,7 +9,6 @@ from scipy.integrate import quad
 # =============================================================================
 
 # --- Simulation Settings ---
-MODE = 2  # 1: Fixed wait time after 1st layer | 2: Always wait for temperature
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
 LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage and plotting overhead
 
@@ -20,8 +19,8 @@ LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 4       # Number of top layers modeled as individual beads (default: 2)
-N_LAYERS_WITH_ELEMENTS = 2  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
 N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
@@ -38,7 +37,6 @@ TRACK_LENGTH = 0.1         # [m] Length of each track
 PROCESS_SPEED = 0.010        # [m/s] Welding speed (travel speed)
 MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
 INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
-MODE_1_WAIT_TIME = 30.0     # [s] Only for Mode 1: Forced pause after layer 1
 ARC_POWER = 2270.0          # [W] Total arc power during welding
 ARC_POWER_CURRENT_FRACTION = 0.5  # Fraction of arc power going to current node (0.0-1.0)
 WIRE_FEED_RATE = 0.04       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
@@ -82,6 +80,18 @@ CP_TABLE = 460.0           # [J/(kg K)]
 RHO_TABLE = 7850.0         # [kg/m^3]
 LAMBDA_TABLE = 45.0        # [W/(m K)]
 EPSILON_TABLE = 0.7        # Emissivity
+
+# --- Table Discretization Settings ---
+# TABLE_DISCRETIZATION_MODE controls how finely the table is subdivided:
+#   Mode 0: Table as single node (fastest, least accurate)
+#   Mode 1: Table subdivided into N_TABLE_X * N_TABLE_Y * N_TABLE_Z nodes (base subdivision)
+#   Mode 2+: Each higher mode adds +1 to each dimension subdivision
+# The base plate is placed on one of the top corner nodes.
+# Validation: Each table node in X/Y direction must be >= BP dimensions
+TABLE_DISCRETIZATION_MODE = 4   # 0 = single node, 1+ = subdivided
+N_TABLE_X = 3               # Base subdivisions along length (X) for Mode 1
+N_TABLE_Y = 2               # Base subdivisions along width (Y) for Mode 1
+N_TABLE_Z = 2               # Base subdivisions along thickness (Z) for Mode 1
 
 # --- Interaction & Environment ---
 AMBIENT_TEMP = 25.0        # [°C]
@@ -161,6 +171,7 @@ class NodeMatrix:
     Matrix-based node tracking for layers, beads, and elements.
     Each node has: layer_num, bead_num, element_num, and discretization level.
     Allows easy neighbor finding (±1 indexing) and radiation surface determination.
+    Also supports multi-node table discretization with 3D grid indexing.
     """
     
     def __init__(self):
@@ -168,16 +179,25 @@ class NodeMatrix:
         self.layer_idx = []      # Layer number (0-based)
         self.bead_idx = []       # Bead number within layer (0-based, -1 for layer-level)
         self.element_idx = []    # Element number within bead (0-based, -1 for bead/layer-level)
-        self.level_type = []     # 'layer', 'bead', or 'element'
+        self.level_type = []     # 'layer', 'bead', 'element', 'special', or 'table'
         
         # Physical properties per node
         self.masses = []         # Mass of each node [kg]
         self.areas = []          # Contact area (for conduction) [m²]
         self.temperatures = []   # Current temperature [°C]
         
-        # Special nodes (table, baseplate)
-        self.table_idx = None
+        # Special nodes (baseplate)
         self.bp_idx = None
+        
+        # Table nodes (can be single or multiple)
+        self.table_indices = []  # List of all table node indices
+        self.table_idx = None    # For backwards compatibility (first table node or single table)
+        self.table_bp_contact_idx = None  # Table node that contacts baseplate
+        
+        # Table grid properties (for multi-node table)
+        self.table_grid = None   # 3D array of node indices: [ix, iy, iz]
+        self.table_node_dims = None  # (dx, dy, dz) dimensions of each table node
+        self.table_subdivisions = None  # (nx, ny, nz) number of subdivisions
         
     def add_node(self, layer_idx, bead_idx, element_idx, level_type, mass, area, temperature):
         """Add a new node to the matrix."""
@@ -195,7 +215,7 @@ class NodeMatrix:
         """Get the layer index of the topmost layer."""
         if not self.layer_idx:
             return -1
-        waam_nodes = [i for i, lt in enumerate(self.level_type) if lt != 'special']
+        waam_nodes = [i for i, lt in enumerate(self.level_type) if lt not in ('special', 'table')]
         if not waam_nodes:
             return -1
         return max(self.layer_idx[i] for i in waam_nodes)
@@ -203,7 +223,7 @@ class NodeMatrix:
     def get_nodes_in_layer(self, layer_idx):
         """Get all node indices in a specific layer."""
         return [i for i in range(len(self.layer_idx)) 
-                if self.layer_idx[i] == layer_idx and self.level_type[i] != 'special']
+                if self.layer_idx[i] == layer_idx and self.level_type[i] not in ('special', 'table')]
     
     def get_nodes_in_bead(self, layer_idx, bead_idx):
         """Get all element nodes within a specific bead."""
@@ -215,7 +235,7 @@ class NodeMatrix:
     def get_layer_level_type(self, layer_idx):
         """Get the discretization level type for a specific layer."""
         for i in range(len(self.layer_idx)):
-            if self.layer_idx[i] == layer_idx and self.level_type[i] != 'special':
+            if self.layer_idx[i] == layer_idx and self.level_type[i] not in ('special', 'table'):
                 return self.level_type[i]
         return None
     
@@ -462,6 +482,148 @@ class NodeMatrix:
                 max_elem = self.element_idx[i]
         return max_elem
     
+    # === Table Grid Methods ===
+    
+    def initialize_table_grid(self, nx, ny, nz, table_length, table_width, table_thickness, 
+                               rho_table, temp_init):
+        """
+        Initialize the table as a 3D grid of thermal nodes.
+        
+        Args:
+            nx, ny, nz: Number of subdivisions in length (X), width (Y), thickness (Z)
+            table_length, table_width, table_thickness: Table dimensions [m]
+            rho_table: Table density [kg/m³]
+            temp_init: Initial temperature [°C]
+        
+        Returns:
+            3D numpy array of node indices
+        """
+        # Calculate node dimensions
+        dx = table_length / nx
+        dy = table_width / ny
+        dz = table_thickness / nz
+        
+        self.table_node_dims = (dx, dy, dz)
+        self.table_subdivisions = (nx, ny, nz)
+        
+        # Calculate node volume and mass
+        node_volume = dx * dy * dz
+        node_mass = node_volume * rho_table
+        
+        # Create 3D grid array for node indices
+        self.table_grid = np.zeros((nx, ny, nz), dtype=np.int32)
+        self.table_indices = []
+        
+        # Add nodes for each grid cell
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    # Use layer_idx=-2 for table, store grid position in bead_idx and element_idx
+                    # We encode position as: bead_idx = ix * 100 + iy, element_idx = iz
+                    node_idx = self.add_node(
+                        layer_idx=-2, 
+                        bead_idx=ix * 100 + iy,  # Encode ix, iy
+                        element_idx=iz, 
+                        level_type='table',
+                        mass=node_mass, 
+                        area=dx * dy,  # Top/bottom face area
+                        temperature=temp_init
+                    )
+                    self.table_grid[ix, iy, iz] = node_idx
+                    self.table_indices.append(node_idx)
+        
+        # Set table_idx for backwards compatibility (use first node)
+        self.table_idx = self.table_indices[0]
+        
+        return self.table_grid
+    
+    def get_table_grid_position(self, node_idx):
+        """Get the (ix, iy, iz) grid position of a table node."""
+        if self.table_grid is None:
+            return None
+        
+        # Find position in grid
+        result = np.where(self.table_grid == node_idx)
+        if len(result[0]) == 0:
+            return None
+        return (result[0][0], result[1][0], result[2][0])
+    
+    def get_table_neighbors(self, node_idx):
+        """
+        Get neighboring table nodes in all 6 directions.
+        
+        Returns:
+            dict with keys: 'x+', 'x-', 'y+', 'y-', 'z+', 'z-'
+            Values are node indices or None if at boundary
+        """
+        if self.table_grid is None:
+            return {}
+        
+        pos = self.get_table_grid_position(node_idx)
+        if pos is None:
+            return {}
+        
+        ix, iy, iz = pos
+        nx, ny, nz = self.table_subdivisions
+        
+        neighbors = {}
+        neighbors['x+'] = self.table_grid[ix+1, iy, iz] if ix + 1 < nx else None
+        neighbors['x-'] = self.table_grid[ix-1, iy, iz] if ix > 0 else None
+        neighbors['y+'] = self.table_grid[ix, iy+1, iz] if iy + 1 < ny else None
+        neighbors['y-'] = self.table_grid[ix, iy-1, iz] if iy > 0 else None
+        neighbors['z+'] = self.table_grid[ix, iy, iz+1] if iz + 1 < nz else None
+        neighbors['z-'] = self.table_grid[ix, iy, iz-1] if iz > 0 else None
+        
+        return neighbors
+    
+    def compute_table_node_radiation_area(self, node_idx):
+        """
+        Compute radiation area for a table node based on exposed faces.
+        
+        A face is exposed if:
+        - It's at the boundary of the table grid
+        - It's not covered by the base plate (for top face of BP-contact node)
+        """
+        if self.table_grid is None:
+            return 0.0
+        
+        pos = self.get_table_grid_position(node_idx)
+        if pos is None:
+            return 0.0
+        
+        ix, iy, iz = pos
+        nx, ny, nz = self.table_subdivisions
+        dx, dy, dz = self.table_node_dims
+        
+        rad_area = 0.0
+        
+        # X faces (length direction)
+        if ix == 0:
+            rad_area += dy * dz  # x- face exposed
+        if ix == nx - 1:
+            rad_area += dy * dz  # x+ face exposed
+        
+        # Y faces (width direction)
+        if iy == 0:
+            rad_area += dx * dz  # y- face exposed
+        if iy == ny - 1:
+            rad_area += dx * dz  # y+ face exposed
+        
+        # Z faces (thickness direction)
+        if iz == 0:
+            rad_area += dx * dy  # z- face (bottom) exposed
+        if iz == nz - 1:
+            # Top face - check if this is the BP contact node
+            if node_idx == self.table_bp_contact_idx:
+                # Subtract BP contact area from top face
+                top_area = dx * dy - CONTACT_BP_TABLE
+                if top_area > 0:
+                    rad_area += top_area
+            else:
+                rad_area += dx * dy  # z+ face (top) exposed
+        
+        return rad_area
+
     def compute_radiation_area(self, node_idx, top_layer_idx):
         """
         Compute radiation area for a node based on its position in the matrix.
@@ -787,8 +949,17 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
     T_amb_K4 = (AMBIENT_TEMP + 273.15)**4
     top_layer_idx = node_matrix.get_top_layer_idx()
     
-    # Table radiation (full surface minus BP contact area)
-    if node_matrix.table_idx is not None:
+    # Table radiation
+    if node_matrix.table_grid is not None:
+        # Multi-node table: compute radiation for each node based on exposed faces
+        for table_node_idx in node_matrix.table_indices:
+            table_rad_area = node_matrix.compute_table_node_radiation_area(table_node_idx)
+            if table_rad_area > 0:
+                Q_balance[table_node_idx] -= (EPSILON_TABLE * STEFAN_BOLTZMANN * 
+                                              table_rad_area * 
+                                              (T_K4[table_node_idx] - T_amb_K4))
+    elif node_matrix.table_idx is not None:
+        # Single-node table (Mode 0)
         table_rad_area = node_matrix.compute_table_radiation_area()
         Q_balance[node_matrix.table_idx] -= (EPSILON_TABLE * STEFAN_BOLTZMANN * 
                                               table_rad_area * 
@@ -869,7 +1040,7 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
     
     # WAAM nodes radiation (using matrix logic)
     for i in range(num_nodes):
-        if node_matrix.level_type[i] == 'special':
+        if node_matrix.level_type[i] in ('special', 'table'):
             continue
         
         rad_area = node_matrix.compute_radiation_area(i, top_layer_idx)
@@ -877,10 +1048,44 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
         Q_balance[i] -= epsilon * STEFAN_BOLTZMANN * rad_area * (T_K4[i] - T_amb_K4)
     
     # --- Conduction ---
-    # Table <-> Base plate
-    if node_matrix.table_idx is not None and node_matrix.bp_idx is not None:
-        q_contact = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[node_matrix.bp_idx] - T[node_matrix.table_idx])
-        Q_balance[node_matrix.table_idx] += q_contact
+    # Table internal conduction (between table nodes) for multi-node table
+    if node_matrix.table_grid is not None:
+        dx, dy, dz = node_matrix.table_node_dims
+        processed_table_pairs = set()
+        
+        for table_node_idx in node_matrix.table_indices:
+            neighbors = node_matrix.get_table_neighbors(table_node_idx)
+            
+            for direction, neighbor_idx in neighbors.items():
+                if neighbor_idx is None:
+                    continue
+                
+                # Avoid double counting
+                pair_key = (min(table_node_idx, neighbor_idx), max(table_node_idx, neighbor_idx))
+                if pair_key in processed_table_pairs:
+                    continue
+                processed_table_pairs.add(pair_key)
+                
+                # Determine contact area and distance based on direction
+                if direction in ('x+', 'x-'):
+                    area = dy * dz  # YZ face
+                    dist = dx
+                elif direction in ('y+', 'y-'):
+                    area = dx * dz  # XZ face
+                    dist = dy
+                else:  # z+, z-
+                    area = dx * dy  # XY face
+                    dist = dz
+                
+                # Fourier conduction
+                q_cond = LAMBDA_TABLE * area / dist * (T[neighbor_idx] - T[table_node_idx])
+                Q_balance[table_node_idx] += q_cond
+                Q_balance[neighbor_idx] -= q_cond
+    
+    # Table <-> Base plate conduction
+    if node_matrix.table_bp_contact_idx is not None and node_matrix.bp_idx is not None:
+        q_contact = ALPHA_CONTACT * CONTACT_BP_TABLE * (T[node_matrix.bp_idx] - T[node_matrix.table_bp_contact_idx])
+        Q_balance[node_matrix.table_bp_contact_idx] += q_contact
         Q_balance[node_matrix.bp_idx] -= q_contact
     
     # Conduction between all nodes (using neighbor finding with cross-level support)
@@ -908,8 +1113,8 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
                 Q_balance[target_idx] -= q_vert
     
     for i in range(num_nodes):
-        if node_matrix.level_type[i] == 'special':
-            continue  # BP already handled above
+        if node_matrix.level_type[i] in ('special', 'table'):
+            continue  # BP and table already handled above
         
         # Vertical conduction (upward) with cross-level support
         cross_info = node_matrix.get_cross_level_vertical_info(i, +1)
@@ -1001,7 +1206,12 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
     new_T = T.copy()
     
     for i in range(num_nodes):
-        if i == node_matrix.table_idx:
+        if node_matrix.level_type[i] == 'table':
+            # Table node - use its individual mass
+            mass = node_matrix.masses[i]
+            new_T[i] += (Q_balance[i] * DT) / (mass * CP_TABLE)
+        elif i == node_matrix.table_idx and node_matrix.table_grid is None:
+            # Single table node (Mode 0) - backwards compatibility
             new_T[i] += (Q_balance[i] * DT) / (model.m_table * CP_TABLE)
         elif i == node_matrix.bp_idx:
             cp = get_cp_bp(T[i])
@@ -1009,7 +1219,7 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
         elif node_matrix.level_type[i] == 'layer':
             cp = get_cp_waam(T[i])
             new_T[i] += (Q_balance[i] * DT) / (model.m_layer * cp)
-        else:  # bead or element level
+        elif node_matrix.level_type[i] in ('bead', 'element'):
             cp = get_cp_waam(T[i])
             mass = node_matrix.masses[i]
             new_T[i] += (Q_balance[i] * DT) / (mass * cp)
@@ -1131,11 +1341,52 @@ def run_simulation():
     # Initialize NodeMatrix
     node_matrix = NodeMatrix()
     
-    # Add table and baseplate nodes
-    node_matrix.table_idx = node_matrix.add_node(
-        layer_idx=-2, bead_idx=-1, element_idx=-1, level_type='special',
-        mass=m_table, area=0.0, temperature=AMBIENT_TEMP
-    )
+    # --- Table discretization validation and initialization ---
+    # Calculate actual subdivisions based on mode
+    if TABLE_DISCRETIZATION_MODE == 0:
+        # Single node table
+        node_matrix.table_idx = node_matrix.add_node(
+            layer_idx=-2, bead_idx=-1, element_idx=-1, level_type='special',
+            mass=m_table, area=0.0, temperature=AMBIENT_TEMP
+        )
+        node_matrix.table_indices = [node_matrix.table_idx]
+        node_matrix.table_bp_contact_idx = node_matrix.table_idx
+        table_info_str = "single node"
+    else:
+        # Multi-node table: Mode N adds (N-1) to each base subdivision
+        nx = N_TABLE_X + (TABLE_DISCRETIZATION_MODE - 1)
+        ny = N_TABLE_Y + (TABLE_DISCRETIZATION_MODE - 1)
+        nz = N_TABLE_Z + (TABLE_DISCRETIZATION_MODE - 1)
+        
+        # Validate that table nodes are not smaller than base plate
+        node_dx = TABLE_LENGTH / nx
+        node_dy = TABLE_WIDTH / ny
+        
+        if node_dx < BP_LENGTH:
+            raise ValueError(
+                f"Table node X-dimension ({node_dx*1000:.1f}mm) is smaller than BP_LENGTH ({BP_LENGTH*1000:.1f}mm). "
+                f"Reduce TABLE_DISCRETIZATION_MODE or N_TABLE_X, or increase TABLE_LENGTH."
+            )
+        if node_dy < BP_WIDTH:
+            raise ValueError(
+                f"Table node Y-dimension ({node_dy*1000:.1f}mm) is smaller than BP_WIDTH ({BP_WIDTH*1000:.1f}mm). "
+                f"Reduce TABLE_DISCRETIZATION_MODE or N_TABLE_Y, or increase TABLE_WIDTH."
+            )
+        
+        # Initialize table grid
+        node_matrix.initialize_table_grid(
+            nx, ny, nz, 
+            TABLE_LENGTH, TABLE_WIDTH, TABLE_THICKNESS,
+            RHO_TABLE, AMBIENT_TEMP
+        )
+        
+        # Place base plate on top corner node (ix=0, iy=0, iz=nz-1 = top layer)
+        node_matrix.table_bp_contact_idx = node_matrix.table_grid[0, 0, nz - 1]
+        
+        total_table_nodes = nx * ny * nz
+        table_info_str = f"{nx}x{ny}x{nz} = {total_table_nodes} nodes (Mode {TABLE_DISCRETIZATION_MODE})"
+    
+    # Add baseplate node
     node_matrix.bp_idx = node_matrix.add_node(
         layer_idx=-1, bead_idx=-1, element_idx=-1, level_type='special',
         mass=m_bp, area=0.0, temperature=AMBIENT_TEMP
@@ -1160,11 +1411,12 @@ def run_simulation():
     if effective_arc_power < 0:
         raise ValueError(f"Arc power ({ARC_POWER:.1f} W) insufficient to melt wire.")
     
-    print(f"Starting simulation (Mode {MODE})...")
+    print("Starting simulation...")
     print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
     print(f"Layer duration: {layer_duration:.1f}s ({NUMBER_OF_TRACKS} tracks at {PROCESS_SPEED*1000:.1f}mm/s)")
     print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
     print(f"Discretization: {N_LAYERS_AS_BEADS} top layers as beads, {N_LAYERS_WITH_ELEMENTS} with elements ({N_ELEMENTS_PER_BEAD}/bead)")
+    print(f"Table discretization: {table_info_str}")
     print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
     
     # Main simulation loop
@@ -1264,11 +1516,7 @@ def run_simulation():
             
             condition_met = t_hottest <= INTERLAYER_TEMP
             
-            # Mode 1 special case
-            if MODE == 1 and i_layer == 0:
-                if current_time - time_start_wait >= MODE_1_WAIT_TIME:
-                    break
-            elif condition_met:
+            if condition_met:
                 break
             
             node_matrix = update_temperatures_matrix(
@@ -1325,6 +1573,13 @@ def run_simulation():
                                 if node_matrix.table_idx is not None:
                                     node_matrix.table_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
                                                                   if lt == 'special' and node_matrix.layer_idx[i] == -2), None)
+                                
+                                # Update table indices if multi-node
+                                if node_matrix.table_grid is not None:
+                                    node_matrix.table_indices = [i for i, lt in enumerate(node_matrix.level_type) if lt == 'table']
+                                    if node_matrix.table_indices:
+                                        node_matrix.table_idx = node_matrix.table_indices[0]
+                                
                                 if node_matrix.bp_idx is not None:
                                     node_matrix.bp_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
                                                                if lt == 'special' and node_matrix.layer_idx[i] == -1), None)
@@ -1361,9 +1616,38 @@ def run_simulation():
                         del node_matrix.temperatures[idx]
                     
                     # Update special indices after deletion
-                    if node_matrix.table_idx is not None:
+                    # Table indices
+                    if node_matrix.table_grid is not None:
+                        # Multi-node table: rebuild grid indices
+                        for table_node_idx in list(node_matrix.table_indices):
+                            # Find new index by searching for table nodes
+                            pass  # Grid indices stored in table_grid are outdated
+                        # Rebuild table_indices list
+                        node_matrix.table_indices = [i for i, lt in enumerate(node_matrix.level_type) if lt == 'table']
+                        if node_matrix.table_indices:
+                            node_matrix.table_idx = node_matrix.table_indices[0]
+                            # Find the BP contact node (top layer, ix=0, iy=0)
+                            node_matrix.table_bp_contact_idx = next(
+                                (i for i in node_matrix.table_indices 
+                                 if node_matrix.element_idx[i] == node_matrix.table_subdivisions[2] - 1 
+                                 and node_matrix.bead_idx[i] == 0),
+                                node_matrix.table_indices[0] if node_matrix.table_indices else None
+                            )
+                            # Rebuild grid
+                            nx, ny, nz = node_matrix.table_subdivisions
+                            new_grid = np.zeros((nx, ny, nz), dtype=np.int32)
+                            for ti in node_matrix.table_indices:
+                                # Decode position from bead_idx and element_idx
+                                encoded = node_matrix.bead_idx[ti]
+                                ix = encoded // 100
+                                iy = encoded % 100
+                                iz = node_matrix.element_idx[ti]
+                                new_grid[ix, iy, iz] = ti
+                            node_matrix.table_grid = new_grid
+                    elif node_matrix.table_idx is not None:
                         node_matrix.table_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
                                                       if lt == 'special' and node_matrix.layer_idx[i] == -2), None)
+                    
                     if node_matrix.bp_idx is not None:
                         node_matrix.bp_idx = next((i for i, lt in enumerate(node_matrix.level_type) 
                                                    if lt == 'special' and node_matrix.layer_idx[i] == -1), None)
@@ -1392,7 +1676,15 @@ def log_data(t, node_matrix, t_log, layers_log, bp_log, temp_table_log):
     
     layers_log.append(layer_temps)
     bp_log.append(node_matrix.temperatures[node_matrix.bp_idx] if node_matrix.bp_idx is not None else AMBIENT_TEMP)
-    temp_table_log.append(node_matrix.temperatures[node_matrix.table_idx] if node_matrix.table_idx is not None else AMBIENT_TEMP)
+    
+    # For table temperature, use max if multi-node or single value
+    if node_matrix.table_indices and len(node_matrix.table_indices) > 1:
+        table_max = max(node_matrix.temperatures[i] for i in node_matrix.table_indices)
+        temp_table_log.append(table_max)
+    elif node_matrix.table_idx is not None:
+        temp_table_log.append(node_matrix.temperatures[node_matrix.table_idx])
+    else:
+        temp_table_log.append(AMBIENT_TEMP)
 
 # =============================================================================
 # EVALUATION & PLOT
@@ -1439,7 +1731,6 @@ def main():
     print("RESULTS")
     print("="*40)
     print(f"Number of layers: {NUMBER_OF_LAYERS}")
-    print(f"Mode: {MODE}")
     print("-" * 20)
     print(f"Calculated wait times (excerpt):")
     for i, w in enumerate(waits):
@@ -1479,7 +1770,7 @@ def main():
                 alpha=0.6, linewidth=0.8, label=label)
     
     plt.plot(t_data, bp_data, label='Base plate', color='blue', linewidth=2)
-    plt.plot(t_data, table_data, label='Welding table', color='grey', linewidth=2)
+    plt.plot(t_data, table_data, label='Welding table (Max)', color='grey', linewidth=2)
     plt.axhline(y=INTERLAYER_TEMP, color='green', linestyle='--', linewidth=2, label='Interpass Temp')
     plt.title('Temperature profile during the process (all layers tracked)')
     plt.ylabel('Temperature [°C]')

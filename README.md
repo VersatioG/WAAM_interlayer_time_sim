@@ -7,8 +7,9 @@ The code models temperature evolution in the welding setup (table, base plate, a
 ## Features
 
 - **Thermal Simulation**: Finite difference methods with Euler explicit time-stepping
-- **Two Simulation Modes**: Fixed wait time after first layer or dynamic waiting until target interlayer temperature
+- **Dynamic Interlayer Waiting**: Always waits until target interlayer temperature is reached before depositing next layer
 - **Detailed Heat Transfer**: Conduction between components, radiation to environment, and arc power input during welding
+- **Multi-Node Table Model**: Welding table can be discretized as a single node or multi-node 3D grid (Mode 0 = single, Mode 1+ = subdivided)
 - **Bead-Level Modeling**: Individual weld tracks (beads) are simulated for the top layers, accounting for sequential deposition and arc power distribution
 - **Arc Power Distribution**: Configurable heat input during welding, distributed to current bead (50-75%), adjacent beads, and underlying components
 - **Temperature-Dependent Properties**: Maier-Kelley equation for specific heat of WAAM wire and base plate
@@ -50,7 +51,8 @@ The script will:
 
 Modify the input parameters at the top of `Thermal_Sim.py` to adjust:
 
-- **Simulation settings**: Mode (fixed/dynamic wait), time step (DT), discretization levels
+- **Simulation settings**: Time step (DT), discretization levels
+- **Table discretization**: `TABLE_DISCRETIZATION_MODE` controls table node count (0 = single node, 1 = base 12 nodes, N = base + 3×(N-1) per dimension)
 - **WAAM process parameters**: Number of layers, layer height, track geometry (width, overlap, number of tracks, length), process speed, temperatures (melting, interlayer), arc power, wire feed rate
 - **Material properties**: Maier-Kelley coefficients, thermal conductivities, densities, emissivities for WAAM wire, base plate, and table
 - **Geometry**: Dimensions of base plate, table, and contact areas
@@ -76,11 +78,25 @@ The core simulation loop in `run_simulation()` iterates through each layer, depo
   - Initial layer nodes (if any)
 - **Material Properties**: Temperature-dependent properties are prepared using Maier-Kelley equations for specific heat capacity of WAAM wire and base plate materials.
 
-#### 2. Layer-by-Layer Deposition Loop
+#### 2. Table Discretization
+
+The welding table can be modeled with varying levels of detail using the `TABLE_DISCRETIZATION_MODE` parameter:
+
+- **Mode 0**: Single node representing the entire table
+- **Mode 1**: Subdivided grid with 3×2×2 = 12 nodes (configured by `N_TABLE_X`, `N_TABLE_Y`, `N_TABLE_Z`)
+- **Mode N (N > 1)**: Extended grid with `(N_TABLE_X + N-1) × (N_TABLE_Y + N-1) × (N_TABLE_Z + N-1)` nodes
+
+Each table node includes:
+- **Internal Conduction**: Fourier heat transfer between adjacent nodes in x, y, and z directions
+- **Selective Radiation**: Only exterior faces of the grid radiate to the environment, interior faces use internal conduction only
+- **Base Plate Contact**: The base plate is positioned at the top-corner node for proper thermal contact
+- **Validation**: Ensures table node dimensions (dx, dy) don't exceed base plate dimensions to prevent overlap
+
+#### 3. Layer-by-Layer Deposition Loop
 
 For each layer `i_layer` from 0 to `NUMBER_OF_LAYERS - 1`:
 
-##### 2.1 Layer Geometry Calculation
+##### 3.1 Layer Geometry Calculation
 
 - Compute the total height of deposited material so far.
 - Calculate the number of tracks per layer based on layer width and bead overlap.
@@ -90,17 +106,17 @@ For each layer `i_layer` from 0 to `NUMBER_OF_LAYERS - 1`:
   - `use_beads = (N_LAYERS_AS_BEADS >= 1)` - Current top layer uses bead-level if enabled
   - Older layers are consolidated based on distance from top: `layers_from_current_top = current_num_layers - layer_idx - 1`
 
-##### 2.2 Track Deposition Within Layer
+##### 3.2 Track Deposition Within Layer
 
 For each track `i_track` in the layer:
 
-###### 2.2.1 Bead Geometry and Mass Calculation
+###### 3.2.1 Bead Geometry and Mass Calculation
 
 - Calculate bead dimensions (width, height, length) based on process parameters.
 - Compute bead volume and mass using material density.
 - Determine bead position and overlap with adjacent beads.
 
-###### 2.2.2 Sequential Bead Welding
+###### 3.2.2 Sequential Bead Welding
 
 For each bead `i_bead` in the track:
 
@@ -120,15 +136,14 @@ For each bead `i_bead` in the track:
 - After welding each bead, wait until the interlayer temperature is reached before depositing the next bead.
 - This ensures sequential cooling between beads within a track.
 
-##### 2.3 Interlayer Waiting
+##### 3.3 Interlayer Waiting
 
 After completing all tracks in a layer:
 
-- **Mode 1 (Fixed Wait)**: Wait a fixed time `FIXED_WAIT_TIME` after the first layer.
-- **Mode 2 (Dynamic Wait)**: Wait until the maximum temperature in the top layer drops to `INTERLAYER_TEMPERATURE`.
+- **Dynamic Wait**: Wait until the maximum temperature in the top layer drops to `INTERLAYER_TEMPERATURE`.
 - During waiting periods, continue thermal simulation with no arc power input, allowing natural cooling through conduction and radiation.
 
-##### 2.4 Layer Consolidation
+##### 3.4 Layer Consolidation
 
 After interlayer waiting:
 
@@ -136,7 +151,7 @@ After interlayer waiting:
 - **Bead-to-Layer Consolidation**: If beads exist beyond `N_LAYERS_AS_BEADS`, combine bead-level nodes into layer-level nodes.
 - **Index Recalculation**: Update special node indices (`table_idx`, `bp_idx`) after node deletion to maintain correct thermal connections.
 
-#### 3. Post-Simulation Analysis
+#### 4. Post-Simulation Analysis
 
 - **Wait Time Extraction**: Collect interlayer wait times for each layer.
 - **Robot Parameter Fitting**: Fit wait times to a mathematical model:
@@ -182,6 +197,7 @@ This approach ensures that the simulation can handle large builds (30+ layers) w
 - **Console output**: Validation messages, simulation progress, fitted robot parameters
 - **Plots**:
   - Temperature vs. time for all components (showing bead-level detail)
+  - Welding table temperature shows maximum (hotspot) rather than average
   - Wait time per layer with linear/cubic fit
 
 ## Limitations
