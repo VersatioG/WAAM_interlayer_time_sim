@@ -25,10 +25,10 @@ N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if
 
 # --- WAAM Process Parameters ---
 NUMBER_OF_LAYERS = 20
-LAYER_HEIGHT = 0.0024       # [m] (e.g., 2.4mm)
+LAYER_HEIGHT = 0.0023       # [m] (e.g., 2.4mm)
 
 # Track geometry
-TRACK_WIDTH = 0.0043         # [m] Width of a single weld track (bead width)
+TRACK_WIDTH = 0.0053         # [m] Width of a single weld track (bead width)
 TRACK_OVERLAP = 0.738        # Center distance in percent of track width (e.g., 73.8% overlap)
 NUMBER_OF_TRACKS = 5        # Number of parallel tracks per layer
 TRACK_LENGTH = 0.1         # [m] Length of each track
@@ -39,7 +39,7 @@ MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
 INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
 ARC_POWER = 2270.0          # [W] Total arc power during welding
 ARC_POWER_CURRENT_FRACTION = 0.5  # Fraction of arc power going to current node (0.0-1.0)
-WIRE_FEED_RATE = 0.04       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
+WIRE_FEED_RATE = 0.08       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
 WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 
 # --- Robot Logic ---
@@ -88,10 +88,10 @@ EPSILON_TABLE = 0.7        # Emissivity
 #   Mode 2+: Each higher mode adds +1 to each dimension subdivision
 # The base plate is placed on one of the top corner nodes.
 # Validation: Each table node in X/Y direction must be >= BP dimensions
-TABLE_DISCRETIZATION_MODE = 2   # 0 = single node, 1+ = subdivided
+TABLE_DISCRETIZATION_MODE = 1   # 0 = single node, 1+ = subdivided
 N_TABLE_X = 3               # Base subdivisions along length (X) for Mode 1
 N_TABLE_Y = 2               # Base subdivisions along width (Y) for Mode 1
-N_TABLE_Z = 2               # Base subdivisions along thickness (Z) for Mode 1
+N_TABLE_Z = 1               # Base subdivisions along thickness (Z) for Mode 1
 
 # --- Interaction & Environment ---
 AMBIENT_TEMP = 25.0        # [°C]
