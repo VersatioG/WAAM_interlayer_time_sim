@@ -73,9 +73,9 @@ LAMBDA_BP = 45.0            # [W/(m K)]
 EPSILON_BP = 0.8            # Emissivity
 
 # --- Geometry & Material: Welding Table ---
-TABLE_LENGTH = 2.5         # [m]
+TABLE_LENGTH = 2           # [m]
 TABLE_WIDTH = 1.2          # [m]
-TABLE_THICKNESS = 0.2      # [m]
+TABLE_THICKNESS = 0.01     # [m]
 CP_TABLE = 460.0           # [J/(kg K)]
 RHO_TABLE = 7850.0         # [kg/m^3]
 LAMBDA_TABLE = 45.0        # [W/(m K)]
