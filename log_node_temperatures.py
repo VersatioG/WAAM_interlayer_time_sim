@@ -31,13 +31,14 @@ from Thermal_Sim import (
     WIRE_FEED_RATE, WIRE_DIAMETER,
     RHO_WAAM, LAMBDA_WAAM, CP_WAAM_A,
     BP_LENGTH, BP_WIDTH, BP_THICKNESS, RHO_BP, LAMBDA_BP, EPSILON_BP,
-    TABLE_LENGTH, TABLE_WIDTH, TABLE_THICKNESS, CP_TABLE, RHO_TABLE, LAMBDA_TABLE, EPSILON_TABLE,
+    TABLE_LENGTH, TABLE_WIDTH, TABLE_THICKNESS, CP_TABLE_A, RHO_TABLE, LAMBDA_TABLE, EPSILON_TABLE,
     TABLE_DISCRETIZATION_MODE, N_TABLE_X, N_TABLE_Y, N_TABLE_Z,
     AMBIENT_TEMP, CONTACT_BP_TABLE, ALPHA_CONTACT, STEFAN_BOLTZMANN,
     # Classes and functions
     NodeMatrix, ThermalModel,
-    get_cp_waam, get_cp_bp, get_epsilon_waam,
+    get_cp_waam, get_cp_bp, get_cp_table, get_epsilon_waam,
     update_temperatures_matrix, calculate_wire_melting_power,
+    TYPE_TABLE, TYPE_SPECIAL, TYPE_LAYER, TYPE_BEAD, TYPE_ELEMENT
 )
 
 
@@ -62,7 +63,7 @@ def compute_node_positions(node_matrix):
         bead = node_matrix.bead_idx[i]
         element = node_matrix.element_idx[i]
         
-        if level == 'table':
+        if level == TYPE_TABLE:
             # Table nodes - use grid position
             pos = node_matrix.get_table_grid_position(i)
             if pos is not None and node_matrix.table_node_dims is not None:
@@ -74,9 +75,12 @@ def compute_node_positions(node_matrix):
                     iy * dy + dy / 2,
                     -(TABLE_THICKNESS - iz * dz - dz / 2)  # Below z=0
                 ]
+            elif node_matrix.table_idx is not None and i == node_matrix.table_idx:
+                 # Single node table
+                 positions[i] = [TABLE_LENGTH/2, TABLE_WIDTH/2, -TABLE_THICKNESS/2]
             node_types.append('table')
             
-        elif level == 'special' and i == node_matrix.bp_idx:
+        elif level == TYPE_SPECIAL and i == node_matrix.bp_idx:
             # Base plate - centered on table corner, above table
             positions[i] = [
                 BP_LENGTH / 2,
@@ -85,7 +89,7 @@ def compute_node_positions(node_matrix):
             ]
             node_types.append('baseplate')
             
-        elif level == 'layer':
+        elif level == TYPE_LAYER:
             # Layer-level node - centered on layer
             positions[i] = [
                 TRACK_LENGTH / 2,
@@ -94,7 +98,7 @@ def compute_node_positions(node_matrix):
             ]
             node_types.append('layer')
             
-        elif level == 'bead':
+        elif level == TYPE_BEAD:
             # Bead-level node
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
             y_offset = 0
@@ -109,7 +113,7 @@ def compute_node_positions(node_matrix):
             ]
             node_types.append('bead')
             
-        elif level == 'element':
+        elif level == TYPE_ELEMENT:
             # Element-level node
             element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
@@ -149,21 +153,24 @@ def compute_node_dimensions(node_matrix):
         level = node_matrix.level_type[i]
         bead = node_matrix.bead_idx[i]
         
-        if level == 'table' and node_matrix.table_node_dims is not None:
-            dx, dy, dz = node_matrix.table_node_dims
-            dimensions[i] = [dx, dy, dz]
+        if level == TYPE_TABLE:
+            if node_matrix.table_node_dims is not None:
+                dx, dy, dz = node_matrix.table_node_dims
+                dimensions[i] = [dx, dy, dz]
+            elif node_matrix.table_idx is not None and i == node_matrix.table_idx:
+                dimensions[i] = [TABLE_LENGTH, TABLE_WIDTH, TABLE_THICKNESS]
             
-        elif level == 'special' and i == node_matrix.bp_idx:
+        elif level == TYPE_SPECIAL and i == node_matrix.bp_idx:
             dimensions[i] = [BP_LENGTH, BP_WIDTH, BP_THICKNESS]
             
-        elif level == 'layer':
+        elif level == TYPE_LAYER:
             dimensions[i] = [TRACK_LENGTH, effective_layer_width, LAYER_HEIGHT]
             
-        elif level == 'bead':
+        elif level == TYPE_BEAD:
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
             dimensions[i] = [TRACK_LENGTH, bead_width, LAYER_HEIGHT]
             
-        elif level == 'element':
+        elif level == TYPE_ELEMENT:
             element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
             bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
             dimensions[i] = [element_length, bead_width, LAYER_HEIGHT]
@@ -211,8 +218,21 @@ def run_simulation_with_logging(num_layers=None, output_file='node_temperatures.
     # Initialize thermal model
     model = ThermalModel(layer_area, side_area_layer, bead_params)
     
+    # Calculate max WAAM nodes
+    max_waam_nodes = num_layers * NUMBER_OF_TRACKS * N_ELEMENTS_PER_BEAD
+    
+    # Calculate table nodes
+    if TABLE_DISCRETIZATION_MODE == 0:
+        num_table_nodes = 1
+        nx, ny, nz = 1, 1, 1
+    else:
+        nx = N_TABLE_X + (TABLE_DISCRETIZATION_MODE - 1)
+        ny = N_TABLE_Y + (TABLE_DISCRETIZATION_MODE - 1)
+        nz = N_TABLE_Z + (TABLE_DISCRETIZATION_MODE - 1)
+        num_table_nodes = nx * ny * nz
+        
     # Initialize node matrix
-    node_matrix = NodeMatrix()
+    node_matrix = NodeMatrix(max_waam_nodes, num_table_nodes, NUMBER_OF_TRACKS, N_ELEMENTS_PER_BEAD)
     
     # Calculate wire melting power
     wire_melting_power = calculate_wire_melting_power(
@@ -225,19 +245,14 @@ def run_simulation_with_logging(num_layers=None, output_file='node_temperatures.
         # Single table node
         vol_table = TABLE_LENGTH * TABLE_WIDTH * TABLE_THICKNESS
         m_table = vol_table * RHO_TABLE
-        table_idx = node_matrix.add_node(
-            layer_idx=-2, bead_idx=-1, element_idx=-1, level_type='table',
-            mass=m_table, area=TABLE_LENGTH * TABLE_WIDTH, temperature=AMBIENT_TEMP
+        table_idx = node_matrix.add_table_node(
+            0, mass=m_table, area=TABLE_LENGTH * TABLE_WIDTH, temperature=AMBIENT_TEMP
         )
         node_matrix.table_idx = table_idx
         node_matrix.table_indices = [table_idx]
         node_matrix.table_bp_contact_idx = table_idx
     else:
         # Multi-node table
-        nx = N_TABLE_X + (TABLE_DISCRETIZATION_MODE - 1)
-        ny = N_TABLE_Y + (TABLE_DISCRETIZATION_MODE - 1)
-        nz = N_TABLE_Z + (TABLE_DISCRETIZATION_MODE - 1)
-        
         node_matrix.initialize_table_grid(
             nx, ny, nz, TABLE_LENGTH, TABLE_WIDTH, TABLE_THICKNESS,
             RHO_TABLE, AMBIENT_TEMP
@@ -248,8 +263,7 @@ def run_simulation_with_logging(num_layers=None, output_file='node_temperatures.
     # Initialize base plate
     vol_bp = BP_LENGTH * BP_WIDTH * BP_THICKNESS
     m_bp = vol_bp * RHO_BP
-    bp_idx = node_matrix.add_node(
-        layer_idx=-1, bead_idx=-1, element_idx=-1, level_type='special',
+    bp_idx = node_matrix.add_bp_node(
         mass=m_bp, area=BP_LENGTH * BP_WIDTH, temperature=AMBIENT_TEMP
     )
     node_matrix.bp_idx = bp_idx
@@ -302,9 +316,9 @@ def run_simulation_with_logging(num_layers=None, output_file='node_temperatures.
                 element_time = element_length / PROCESS_SPEED
                 
                 for i_elem in range(N_ELEMENTS_PER_BEAD):
-                    new_idx = node_matrix.add_node(
+                    new_idx = node_matrix.activate_waam_node(
                         layer_idx=i_layer, bead_idx=i_track, element_idx=i_elem,
-                        level_type='element', mass=element_mass, area=element_area,
+                        level_type_str='element', mass=element_mass, area=element_area,
                         temperature=MELTING_TEMP
                     )
                     
@@ -326,9 +340,9 @@ def run_simulation_with_logging(num_layers=None, output_file='node_temperatures.
                             node_metadata_snapshots.append((positions.copy(), dims.copy(), types.copy()))
             else:
                 # Add bead node
-                new_idx = node_matrix.add_node(
+                new_idx = node_matrix.activate_waam_node(
                     layer_idx=i_layer, bead_idx=i_track, element_idx=-1,
-                    level_type='bead', mass=bead_mass, area=bead_area,
+                    level_type_str='bead', mass=bead_mass, area=bead_area,
                     temperature=MELTING_TEMP
                 )
                 

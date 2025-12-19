@@ -7,12 +7,14 @@ The code models temperature evolution in the welding setup (table, base plate, a
 ## Features
 
 - **Thermal Simulation**: Finite difference methods with Euler explicit time-stepping
+- **High-Performance Vectorization**: Optimized using NumPy vectorization for radiation and temperature updates, significantly reducing computation time
 - **Dynamic Interlayer Waiting**: Always waits until target interlayer temperature is reached before depositing next layer
 - **Detailed Heat Transfer**: Conduction between components, radiation to environment, and arc power input during welding
+- **Optimized Node Management**: `NodeMatrix` class with pre-allocated arrays and incremental radiation area tracking for O(1) neighbor lookups
 - **Multi-Node Table Model**: Welding table can be discretized as a single node or multi-node 3D grid (Mode 0 = single, Mode 1+ = subdivided)
 - **Bead-Level Modeling**: Individual weld tracks (beads) are simulated for the top layers, accounting for sequential deposition and arc power distribution
 - **Arc Power Distribution**: Configurable heat input during welding, distributed to current bead (50-75%), adjacent beads, and underlying components
-- **Temperature-Dependent Properties**: Maier-Kelley equation for specific heat of WAAM wire and base plate
+- **Temperature-Dependent Properties**: Maier-Kelley equation for specific heat of WAAM wire and base plate, implemented with vectorized calculations
 - **Flexible Robot Parameter Fitting**: Linear or cubic fitting of interlayer wait times with non-negative constraints
 - **Comprehensive Visualization**: Temperature profiles and wait time analysis with fitting curves
 - **Efficient Data Structures**: Numpy-based arrays for fast computation, with prepared element-level discretization for finer resolution
@@ -106,11 +108,12 @@ The core simulation loop in `run_simulation()` iterates through each layer, depo
 
 - **Parameter Validation**: The script first validates critical parameters such as time step stability (DT must satisfy the Fourier number for numerical stability), discretization settings, and physical constraints.
 - **Thermal Model Setup**: A `ThermalModel` object is created to precompute geometric properties and contact areas between components (table-baseplate, baseplate-layers, layer-layer interfaces).
-- **Node Matrix Initialization**: A `NodeMatrix` object initializes the thermal nodes representing the welding setup:
-  - Table node (bottom component)
+- **Node Matrix Initialization**: A `NodeMatrix` object initializes the thermal nodes representing the welding setup using pre-allocated NumPy arrays:
+  - Table nodes (bottom component)
   - Base plate node
-  - Initial layer nodes (if any)
-- **Material Properties**: Temperature-dependent properties are prepared using Maier-Kelley equations for specific heat capacity of WAAM wire and base plate materials.
+  - WAAM layer nodes (pre-allocated for maximum capacity)
+- **Incremental Radiation Tracking**: Radiation areas are tracked incrementally as nodes are activated or consolidated, avoiding expensive neighbor searches during the simulation loop.
+- **Material Properties**: Temperature-dependent properties are prepared using vectorized Maier-Kelley equations for specific heat capacity of WAAM wire and base plate materials.
 
 #### 2. Table Discretization
 
@@ -162,8 +165,8 @@ For each bead `i_bead` in the track:
 - **Wire Melting Energy**: Calculated by integrating temperature-dependent specific heat from room temperature to melting point, subtracted from total arc power.
 - **Temperature Update**: For each time step during welding:
   - Compute heat conduction between all thermal nodes (table ↔ baseplate ↔ layers ↔ beads)
-  - Calculate radiation losses from exposed surfaces using Stefan-Boltzmann law with temperature-dependent emissivity
-  - Update temperatures using Euler explicit finite difference method: `T_new = T_old + DT * (heat_sources - heat_sinks) / (mass * cp)`
+  - Calculate radiation losses for all active nodes using vectorized Stefan-Boltzmann calculations with pre-computed radiation areas
+  - Update temperatures for all active nodes simultaneously using vectorized Euler explicit finite difference method: `T_new = T_old + DT * (heat_sources - heat_sinks) / (mass * cp)`
 
 **Inter-Bead Waiting (Mode 1 only):**
 
@@ -225,6 +228,14 @@ The simulation employs a dynamic discretization strategy that optimizes computat
 - **Accuracy Preservation**: Maintains detailed thermal gradients in recently deposited material where they matter most for interlayer cooling decisions
 
 This approach ensures that the simulation can handle large builds (30+ layers) while keeping computation times reasonable, with the most critical thermal interactions modeled at appropriate resolution levels.
+
+### Performance and Optimization
+
+The simulation is designed for high performance to allow for rapid parameter studies:
+- **Vectorized Operations**: Most thermal calculations (radiation, temperature updates, property evaluations) are performed on entire arrays at once using NumPy, minimizing Python loop overhead.
+- **O(1) Neighbor Lookups**: The `NodeMatrix` uses a structured grid mapping to find neighbors in constant time, avoiding expensive search algorithms.
+- **Incremental State Updates**: Properties like radiation area and baseplate coverage are updated only when the geometry changes (activation/consolidation), rather than being recalculated every time step.
+- **Pre-allocation**: All major data arrays are pre-allocated at startup to avoid memory fragmentation and allocation overhead during the simulation.
 
 ## Output
 
