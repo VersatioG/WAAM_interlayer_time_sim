@@ -1185,12 +1185,13 @@ def calculate_wire_melting_power(wire_feed_rate, wire_diameter, ambient_temp, me
     # Mass flow rate of wire
     mass_flow_rate = wire_area * wire_feed_rate * rho_wire  # [kg/s]
     
-    # Function to integrate: cp as function of temperature in Celsius
-    def cp_integrand(temp_c):
-        return get_cp_waam(temp_c)  # [J/(kg K)]
-    
     # Numerical integration of ∫cp dT from ambient_temp to melting_temp
-    energy_per_kg, _ = quad(cp_integrand, ambient_temp, melting_temp)  # [J/kg]
+    # Using trapezoidal rule on discretized array to avoid quad integration warnings
+    # with non-smooth interpolated Cp functions.
+    num_steps = int(max(100, (melting_temp - ambient_temp) * 2)) # Resolution approx 0.5K
+    temps = np.linspace(ambient_temp, melting_temp, num_steps)
+    cps = get_cp_waam_vectorized(temps)
+    energy_per_kg = np.trapezoid(cps, temps)  # [J/kg]
     
     # Power = mass_flow_rate * energy_per_kg
     power_wire_melting = mass_flow_rate * energy_per_kg  # [W]
@@ -1380,6 +1381,7 @@ def run_simulation():
     print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
     print(f"Discretization: {N_LAYERS_AS_BEADS} top layers as beads, {N_LAYERS_WITH_ELEMENTS} with elements ({N_ELEMENTS_PER_BEAD}/bead)")
     print(f"Table discretization: {table_info_str}")
+    print(f"Max stable DT: {dt_max_stable:.4f} s (using {dt_sim:.4f} s)")
     print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
     
     # Main simulation loop
