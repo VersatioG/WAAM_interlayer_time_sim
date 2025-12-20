@@ -30,7 +30,7 @@ LAYER_HEIGHT = 0.0023       # [m] (e.g., 2.4mm)
 
 # Track geometry
 TRACK_WIDTH = 0.0053         # [m] Width of a single weld track (bead width)
-TRACK_OVERLAP = 0.738        # Center distance in percent of track width (e.g., 73.8% overlap)
+TRACK_OVERLAP = 0.738        # Center distance ratio (Programmed distance / TRACK_WIDTH)
 NUMBER_OF_TRACKS = 5        # Number of parallel tracks per layer
 TRACK_LENGTH = 0.285         # [m] Length of each track
 
@@ -252,11 +252,11 @@ class NodeMatrix:
         
         if l_type == TYPE_ELEMENT:
             element_length = TRACK_LENGTH / self.num_elements_per_bead
-            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * TRACK_OVERLAP
             rad_area = (element_length * bead_width) + (2 * element_length * LAYER_HEIGHT) + (2 * bead_width * LAYER_HEIGHT)
             
         elif l_type == TYPE_BEAD:
-            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * TRACK_OVERLAP
             rad_area = (bead_width * TRACK_LENGTH) + (2 * TRACK_LENGTH * LAYER_HEIGHT) + (2 * bead_width * LAYER_HEIGHT)
             
         elif l_type == TYPE_LAYER:
@@ -700,7 +700,7 @@ class NodeMatrix:
             rad_area += side_area
             
         elif level == TYPE_BEAD:
-            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * TRACK_OVERLAP
             bead_top_area = bead_width * TRACK_LENGTH
             
             if is_top: rad_area += bead_top_area
@@ -726,7 +726,7 @@ class NodeMatrix:
                     
         elif level == TYPE_ELEMENT:
             element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
-            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * TRACK_OVERLAP
             element_top_area = element_length * bead_width
             
             if is_top: rad_area += element_top_area
@@ -822,7 +822,7 @@ class NodeMatrix:
             self.temperatures[bead_node_idx] = avg_temp
             
             # Area calculation for bead
-            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP)
+            bead_width = TRACK_WIDTH if bead == 0 else TRACK_WIDTH * TRACK_OVERLAP
             self.areas[bead_node_idx] = bead_width * TRACK_LENGTH
             
             self.active_waam_indices.add(bead_node_idx)
@@ -947,7 +947,8 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
             else:
                 length = TRACK_LENGTH
                 
-            contact_areas.append(TRACK_WIDTH * TRACK_OVERLAP * length)
+            # Contact area for arc power distribution: length * height (vertical face)
+            contact_areas.append(length * LAYER_HEIGHT)
         
         # Vertical neighbor (layer below)
         v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
@@ -1109,7 +1110,8 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
         # Horizontal conduction
         h_right = node_matrix.get_horizontal_neighbor(i, +1)
         if h_right is not None:
-            overlap_width = TRACK_WIDTH * TRACK_OVERLAP
+            # Distance for conduction is the center-to-center distance
+            dist = TRACK_WIDTH * TRACK_OVERLAP
             
             # Fix: Use correct length for contact area (Element vs Bead)
             if node_matrix.level_type[i] == TYPE_ELEMENT:
@@ -1117,8 +1119,9 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
             else:
                 length = TRACK_LENGTH
                 
-            contact_area = overlap_width * length
-            dist = overlap_width
+            # Contact area: perpendicular to heat flow direction (horizontal)
+            # Heat flows horizontally, so area = length * LAYER_HEIGHT
+            contact_area = length * LAYER_HEIGHT
             q_horiz = LAMBDA_WAAM * contact_area / dist * (T[h_right] - T[i])
             Q_balance[i] += q_horiz
             Q_balance[h_right] -= q_horiz
@@ -1126,8 +1129,8 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
         # Longitudinal conduction
         l_forward = node_matrix.get_longitudinal_neighbor(i, +1)
         if l_forward is not None:
-            element_length = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
-            bead_width = (TRACK_WIDTH if node_matrix.bead_idx[i] == 0 else TRACK_WIDTH * (1 - TRACK_OVERLAP))
+            element_length = TRACK_LENGTH / node_matrix.num_elements_per_bead
+            bead_width = (TRACK_WIDTH if node_matrix.bead_idx[i] == 0 else TRACK_WIDTH * TRACK_OVERLAP)
             area = bead_width * LAYER_HEIGHT
             dist = element_length
             q_long = LAMBDA_WAAM * area / dist * (T[l_forward] - T[i])
@@ -1246,7 +1249,7 @@ def run_simulation():
     # 1. Layer height
     d_z = LAYER_HEIGHT
     # 2. Effective bead width (distance between bead centers)
-    d_y = TRACK_WIDTH * (1.0 - TRACK_OVERLAP)
+    d_y = TRACK_WIDTH * TRACK_OVERLAP
     # 3. Element length (if elements are used)
     if N_LAYERS_WITH_ELEMENTS > 0 and N_ELEMENTS_PER_BEAD > 0:
         d_x = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
@@ -1268,7 +1271,7 @@ def run_simulation():
         dt_sim = dt_max_stable
     
     # Calculate geometry
-    effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
+    effective_layer_width = TRACK_WIDTH + (NUMBER_OF_TRACKS - 1) * TRACK_WIDTH * TRACK_OVERLAP
     layer_area = effective_layer_width * TRACK_LENGTH
     layer_volume = layer_area * LAYER_HEIGHT
     side_area_layer = 2 * (TRACK_LENGTH * LAYER_HEIGHT + effective_layer_width * LAYER_HEIGHT)
@@ -1277,15 +1280,13 @@ def run_simulation():
     layer_duration = total_weld_distance / PROCESS_SPEED
     
     # Bead geometry
-    bead_width_effective = TRACK_WIDTH * (1 - TRACK_OVERLAP)
+    bead_width_added = TRACK_WIDTH * TRACK_OVERLAP
     bead_area_first = TRACK_WIDTH * TRACK_LENGTH
-    bead_area_subsequent = bead_width_effective * TRACK_LENGTH
+    bead_area_subsequent = bead_width_added * TRACK_LENGTH
     bead_volume_first = bead_area_first * LAYER_HEIGHT
     bead_volume_subsequent = bead_area_subsequent * LAYER_HEIGHT
     m_bead_first = bead_volume_first * RHO_WAAM
     m_bead_subsequent = bead_volume_subsequent * RHO_WAAM
-    overlap_width = TRACK_WIDTH * TRACK_OVERLAP
-    bead_contact_area = overlap_width * TRACK_LENGTH
     bead_duration = TRACK_LENGTH / PROCESS_SPEED
     
     # Element geometry (if enabled)
@@ -1303,9 +1304,7 @@ def run_simulation():
         'bead_area_subsequent': bead_area_subsequent,
         'm_bead_first': m_bead_first,
         'm_bead_subsequent': m_bead_subsequent,
-        'bead_contact_area': bead_contact_area,
-        'bead_duration': bead_duration,
-        'overlap_width': overlap_width
+        'bead_duration': bead_duration
     }
     
     thermal_model = ThermalModel(layer_area, side_area_layer, bead_params)
