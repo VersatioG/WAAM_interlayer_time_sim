@@ -910,7 +910,7 @@ class ThermalModel:
                                    BP_WIDTH * BP_THICKNESS)
 
 
-def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0.0, welding_node_idx=None):
+def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_power=0.0, welding_node_idx=None):
     """
     Update temperatures using NodeMatrix for efficient neighbor finding and radiation calculation.
     """
@@ -1134,11 +1134,11 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
         # But let's be safe
         valid_mass = masses_active > 0
         if np.all(valid_mass):
-            new_T[active_indices_arr] += (Q_balance[active_indices_arr] * DT) / (masses_active * cp_active)
+            new_T[active_indices_arr] += (Q_balance[active_indices_arr] * dt) / (masses_active * cp_active)
         else:
             # Fallback for safe update
             safe_indices = active_indices_arr[valid_mass]
-            new_T[safe_indices] += (Q_balance[safe_indices] * DT) / (masses_active[valid_mass] * cp_active[valid_mass])
+            new_T[safe_indices] += (Q_balance[safe_indices] * dt) / (masses_active[valid_mass] * cp_active[valid_mass])
             
     # Update Table and BP nodes
     if node_matrix.table_grid is not None:
@@ -1148,17 +1148,17 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
             T_table = T[table_indices]
             cp_table = get_cp_table_vectorized(T_table)
             masses_table = node_matrix.masses[table_indices]
-            new_T[table_indices] += (Q_balance[table_indices] * DT) / (masses_table * cp_table)
+            new_T[table_indices] += (Q_balance[table_indices] * dt) / (masses_table * cp_table)
             
     elif node_matrix.table_idx is not None:
         i = node_matrix.table_idx
         cp = get_cp_table(T[i])
-        new_T[i] += (Q_balance[i] * DT) / (model.m_table * cp)
+        new_T[i] += (Q_balance[i] * dt) / (model.m_table * cp)
         
     if node_matrix.bp_idx is not None:
         i = node_matrix.bp_idx
         cp = get_cp_bp(T[i])
-        new_T[i] += (Q_balance[i] * DT) / (model.m_bp * cp)
+        new_T[i] += (Q_balance[i] * dt) / (model.m_bp * cp)
             
     node_matrix.temperatures[:] = new_T
     return node_matrix
@@ -1222,14 +1222,37 @@ def run_simulation():
     if DT <= 0:
         raise ValueError(f"DT ({DT}) must be > 0")
     
-    # Check DT stability
-    # Use Cp at room temperature for stability check
+    # --- Stability Check & Auto-Correction ---
+    # Calculate thermal diffusivity at room temperature (worst case for conduction)
     cp_ref = get_cp_waam(20.0)
     alpha = LAMBDA_WAAM / (RHO_WAAM * cp_ref)
-    dx_min = min(LAYER_HEIGHT, TRACK_WIDTH / max(N_ELEMENTS_PER_BEAD, 1))
-    dt_max_stable = dx_min**2 / (2 * alpha)
-    if DT > dt_max_stable:
-        print(f"Warning: DT ({DT:.3f}s) may be too large for stability. Recommended max: {dt_max_stable:.3f}s")
+    
+    # Determine smallest spatial dimension
+    # 1. Layer height
+    d_z = LAYER_HEIGHT
+    # 2. Effective bead width (smallest width due to overlap)
+    d_y = TRACK_WIDTH * (1.0 - TRACK_OVERLAP)
+    # 3. Element length (if elements are used)
+    if N_LAYERS_WITH_ELEMENTS > 0 and N_ELEMENTS_PER_BEAD > 0:
+        d_x = TRACK_LENGTH / N_ELEMENTS_PER_BEAD
+    else:
+        d_x = TRACK_LENGTH # Bead length
+        
+    dx_min = min(d_x, d_y, d_z)
+    
+    # 3D Stability criterion: dt <= dx^2 / (factor * alpha)
+    # Factor 2 is for 1D, 4 for 2D, 6 for 3D. Using 6 for safety.
+    dt_max_stable = dx_min**2 / (6 * alpha)
+    
+    # Use local variable for simulation time step
+    dt_sim = DT
+    
+    if dt_sim > dt_max_stable:
+        print(f"WARNING: Configured DT ({dt_sim:.4f}s) is unstable for the current discretization.")
+        print(f"  Smallest dimension: {dx_min*1000:.2f} mm")
+        print(f"  Max stable DT: {dt_max_stable:.4f} s")
+        print(f"  -> Auto-adjusting DT to {dt_max_stable:.4f} s")
+        dt_sim = dt_max_stable
     
     # Calculate geometry
     effective_layer_width = TRACK_WIDTH * NUMBER_OF_TRACKS - TRACK_WIDTH * (NUMBER_OF_TRACKS - 1) * (1 - TRACK_OVERLAP)
@@ -1391,13 +1414,13 @@ def run_simulation():
                         )
                         
                         # Simulate welding of this element
-                        steps = int(element_duration / DT)
+                        steps = int(element_duration / dt_sim)
                         for _ in range(steps):
                             node_matrix = update_temperatures_matrix(
-                                node_matrix, thermal_model, is_welding=True,
+                                node_matrix, thermal_model, dt=dt_sim, is_welding=True,
                                 arc_power=effective_arc_power, welding_node_idx=welding_node_idx
                             )
-                            current_time += DT
+                            current_time += dt_sim
                             
                             logging_counter += 1
                             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
@@ -1411,13 +1434,13 @@ def run_simulation():
                     )
                     
                     # Simulate welding of this bead
-                    steps = int(bead_duration / DT)
+                    steps = int(bead_duration / dt_sim)
                     for _ in range(steps):
                         node_matrix = update_temperatures_matrix(
-                            node_matrix, thermal_model, is_welding=True,
+                            node_matrix, thermal_model, dt=dt_sim, is_welding=True,
                             arc_power=effective_arc_power, welding_node_idx=welding_node_idx
                         )
-                        current_time += DT
+                        current_time += dt_sim
                         
                         logging_counter += 1
                         if logging_counter % LOGGING_EVERY_N_STEPS == 0:
@@ -1431,13 +1454,13 @@ def run_simulation():
             )
             
             # Simulate entire layer deposition
-            steps = int(layer_duration / DT)
+            steps = int(layer_duration / dt_sim)
             for _ in range(steps):
                 node_matrix = update_temperatures_matrix(
-                    node_matrix, thermal_model, is_welding=True,
+                    node_matrix, thermal_model, dt=dt_sim, is_welding=True,
                     arc_power=effective_arc_power, welding_node_idx=layer_node_idx
                 )
-                current_time += DT
+                current_time += dt_sim
                 
                 logging_counter += 1
                 if logging_counter % LOGGING_EVERY_N_STEPS == 0:
@@ -1459,10 +1482,15 @@ def run_simulation():
             if condition_met:
                 break
             
+            # Safety check for instability
+            if t_hottest > 5000.0:
+                print(f"Warning: Instability detected (T={t_hottest:.1f}°C). Breaking cooling loop.")
+                break
+
             node_matrix = update_temperatures_matrix(
-                node_matrix, thermal_model, is_welding=False
+                node_matrix, thermal_model, dt=dt_sim, is_welding=False
             )
-            current_time += DT
+            current_time += dt_sim
             
             logging_counter += 1
             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
