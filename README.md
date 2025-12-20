@@ -14,7 +14,12 @@ The code models temperature evolution in the welding setup (table, base plate, a
 - **Multi-Node Table Model**: Welding table can be discretized as a single node or multi-node 3D grid (Mode 0 = single, Mode 1+ = subdivided)
 - **Bead-Level Modeling**: Individual weld tracks (beads) are simulated for the top layers, accounting for sequential deposition and arc power distribution
 - **Arc Power Distribution**: Configurable heat input during welding, distributed to current bead (50-75%), adjacent beads, and underlying components
-- **Temperature-Dependent Properties**: Maier-Kelley equation for specific heat of WAAM wire and base plate, implemented with vectorized calculations
+- **Advanced Material Modeling**: Research-based thermodynamic model for S235JR steel (0°C to 2500°C) including:
+    - **Eurocode 3 (EN 1993-1-2)** for solid phase (0-1200°C)
+    - **Effective Heat Capacity Method** for melting range (Solidus 1517°C - Liquidus 1535°C) with Gaussian smoothing for numerical stability
+    - **NIST/Shomate data** for liquid phase (up to 2500°C)
+- **Modular Material System**: Extensible `Material` class architecture allowing easy addition of new materials (e.g., Stainless Steel, Inconel)
+- **High-Performance Interpolation**: Optimized using `numpy.interp` and vectorized updates for table/WAAM nodes, ensuring minimal overhead from complex material models
 - **Flexible Robot Parameter Fitting**: Linear or cubic fitting of interlayer wait times with non-negative constraints
 - **Comprehensive Visualization**: Temperature profiles and wait time analysis with fitting curves
 - **Efficient Data Structures**: Numpy-based arrays for fast computation, with prepared element-level discretization for finer resolution
@@ -90,9 +95,27 @@ Modify the input parameters at the top of `Thermal_Sim.py` to adjust:
 - **Simulation settings**: Time step (DT), discretization levels
 - **Table discretization**: `TABLE_DISCRETIZATION_MODE` controls table node count (0 = single node, 1 = base 12 nodes, N = base + 3×(N-1) per dimension)
 - **WAAM process parameters**: Number of layers, layer height, track geometry (width, overlap, number of tracks, length), process speed, temperatures (melting, interlayer), arc power, wire feed rate
-- **Material properties**: Maier-Kelley coefficients, thermal conductivities, densities, emissivities for WAAM wire, base plate, and table
+- **Material selection**: Choose from a database of materials (default: S235JR) for WAAM wire, base plate, and table
+- **Material properties**: Thermal conductivities, densities, emissivities for WAAM wire, base plate, and table
 - **Geometry**: Dimensions of base plate, table, and contact areas
 - **Robot fitting mode**: Choose between "linear" or "cubic" for interlayer wait time approximation (with non-negative constraints)
+
+### Adding New Materials
+
+The simulation uses a modular material system defined in `Material_Properties.py`. To add a new material:
+
+1.  Define a new class inheriting from `Material` in `Material_Properties.py`.
+2.  Implement the `__init__` method to set physical constants and generate a lookup table.
+3.  Register the material in the `_materials` dictionary.
+4.  Update the material name in the configuration section of `Thermal_Sim.py`.
+
+Example:
+```python
+class StainlessSteel316L(Material):
+    def __init__(self):
+        super().__init__("SS316L")
+        # Define properties and lookup table...
+```
 
 ## How the Simulation Works
 
@@ -113,7 +136,7 @@ The core simulation loop in `run_simulation()` iterates through each layer, depo
   - Base plate node
   - WAAM layer nodes (pre-allocated for maximum capacity)
 - **Incremental Radiation Tracking**: Radiation areas are tracked incrementally as nodes are activated or consolidated, avoiding expensive neighbor searches during the simulation loop.
-- **Material Properties**: Temperature-dependent properties are prepared using vectorized Maier-Kelley equations for specific heat capacity of WAAM wire and base plate materials.
+- **Material Properties**: Temperature-dependent properties are implemented using a research-based thermodynamic model for S235JR (Eurocode 3 + Effective Heat Capacity Method + NIST data), optimized with vectorized lookup tables.
 
 #### 2. Table Discretization
 
@@ -206,7 +229,7 @@ After interlayer waiting:
 
 #### Material Properties
 
-- **Specific Heat**: Maier-Kelley polynomial for temperature dependence
+- **Specific Heat**: Research-based thermodynamic model (Eurocode 3, Effective Heat Capacity Method, NIST/Shomate) for S235JR steel.
 - **Thermal Conductivity**: Constant values for each material
 - **Density**: Constant for mass calculations
 - **Emissivity**: Temperature-dependent for radiation calculations

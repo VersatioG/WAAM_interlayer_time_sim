@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import curve_fit
 from scipy.integrate import quad
+from Material_Properties import get_material
 
 # =============================================================================
 # INPUT BLOCK (Adjust values here)
@@ -48,12 +49,7 @@ WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 ROBOT_FIT_MODE = "cubic"  # "linear" or "cubic"
 
 # --- Geometry & Material: WAAM Wire ---
-# Maier-Kelley coefficients for solid steel (Ex: Structural steel/Stainless steel mix)
-# cp = A + B*T + C*T^(-2)  [J/(kg K)]
-CP_WAAM_A = 450.0
-CP_WAAM_B = 0.28
-CP_WAAM_C = -2.0e5
-CP_WAAM_LIQUID = 800.0     # [J/(kg K)] Constant capacity when molten
+MATERIAL_WAAM_NAME = "S235JR"
 RHO_WAAM = 7800.0          # [kg/m^3] Density
 LAMBDA_WAAM = 45.0         # [W/(m K)] Thermal conductivity
 EPSILON_WAAM = 0.6         # Emissivity (solid)
@@ -63,11 +59,8 @@ EPSILON_WAAM_LIQUID = 0.3  # Emissivity (liquid/molten)
 BP_LENGTH = 0.15           # [m]
 BP_WIDTH = 0.15            # [m]
 BP_THICKNESS = 0.01        # [m]
-# Maier-Kelley coefficients for base plate
-CP_BP_A = 450.0
-CP_BP_B = 0.28
-CP_BP_C = -2.0e5
-CP_BP_LIQUID = 800.0        # [J/(kg K)] Constant capacity when molten
+
+MATERIAL_BP_NAME = "S235JR"
 RHO_BP = 7850.0             # [kg/m^3]
 LAMBDA_BP = 45.0            # [W/(m K)]
 EPSILON_BP = 0.8            # Emissivity
@@ -76,11 +69,8 @@ EPSILON_BP = 0.8            # Emissivity
 TABLE_LENGTH = 2           # [m]
 TABLE_WIDTH = 1.2          # [m]
 TABLE_THICKNESS = 0.01     # [m]
-# Maier-Kelley coefficients for table
-CP_TABLE_A = 460.0
-CP_TABLE_B = 0.28
-CP_TABLE_C = -2.0e5
-CP_TABLE_LIQUID = 800.0    # [J/(kg K)] Constant capacity when molten
+
+MATERIAL_TABLE_NAME = "S235JR"
 RHO_TABLE = 7850.0         # [kg/m^3]
 LAMBDA_TABLE = 45.0        # [W/(m K)]
 EPSILON_TABLE = 0.8        # Emissivity
@@ -107,44 +97,29 @@ STEFAN_BOLTZMANN = 5.67e-8 # [W/(m^2 K^4)]
 # HELPER FUNCTIONS
 # =============================================================================
 
+#initialize materials
+_material_waam = get_material(MATERIAL_WAAM_NAME)
+_material_bp = get_material(MATERIAL_BP_NAME)
+_material_table = get_material(MATERIAL_TABLE_NAME)
+
+
 def get_cp_waam(temp_c):
     """
-    Calculates the specific heat capacity according to Maier-Kelley.
-    With step function at melting temperature.
+    Calculates the specific heat capacity for WAAM material.
     """
-    if temp_c >= MELTING_TEMP:
-        return CP_WAAM_LIQUID
-    
-    # Maier-Kelley: T in Kelvin for the formula is common, 
-    # here simplified on Celsius inputs or we convert.
-    # Common MK formulas use Kelvin.
-    tk = temp_c + 273.15
-    cp = CP_WAAM_A + (CP_WAAM_B * tk) + (CP_WAAM_C * tk**-2)
-    return cp
+    return _material_waam.get_cp(temp_c)
 
 def get_cp_bp(temp_c):
     """
-    Calculates the specific heat capacity for the base plate according to Maier-Kelley.
-    With step function at melting temperature.
+    Calculates the specific heat capacity for the base plate.
     """
-    if temp_c >= MELTING_TEMP:
-        return CP_BP_LIQUID
-    
-    tk = temp_c + 273.15
-    cp = CP_BP_A + (CP_BP_B * tk) + (CP_BP_C * tk**-2)
-    return cp
+    return _material_bp.get_cp(temp_c)
 
 def get_cp_table(temp_c):
     """
-    Calculates the specific heat capacity for the table according to Maier-Kelley.
-    With step function at melting temperature.
+    Calculates the specific heat capacity for the table.
     """
-    if temp_c >= MELTING_TEMP:
-        return CP_TABLE_LIQUID
-    
-    tk = temp_c + 273.15
-    cp = CP_TABLE_A + (CP_TABLE_B * tk) + (CP_TABLE_C * tk**-2)
-    return cp
+    return _material_table.get_cp(temp_c)
 
 def get_epsilon_waam(temp_c):
     """
@@ -161,29 +136,11 @@ def kelvin(temp_c):
 
 def get_cp_waam_vectorized(temps):
     """Vectorized version of get_cp_waam for numpy arrays."""
-    temps = np.atleast_1d(temps)
-    result = np.zeros_like(temps, dtype=np.float64)
-    liquid_mask = temps >= MELTING_TEMP
-    solid_mask = ~liquid_mask
-    
-    result[liquid_mask] = CP_WAAM_LIQUID
-    if np.any(solid_mask):
-        tk = temps[solid_mask] + 273.15
-        result[solid_mask] = CP_WAAM_A + (CP_WAAM_B * tk) + (CP_WAAM_C * tk**-2)
-    return result
+    return _material_waam.get_cp(temps)
 
 def get_cp_table_vectorized(temps):
     """Vectorized version of get_cp_table for numpy arrays."""
-    temps = np.atleast_1d(temps)
-    result = np.zeros_like(temps, dtype=np.float64)
-    liquid_mask = temps >= MELTING_TEMP
-    solid_mask = ~liquid_mask
-    
-    result[liquid_mask] = CP_TABLE_LIQUID
-    if np.any(solid_mask):
-        tk = temps[solid_mask] + 273.15
-        result[solid_mask] = CP_TABLE_A + (CP_TABLE_B * tk) + (CP_TABLE_C * tk**-2)
-    return result
+    return _material_table.get_cp(temps)
 
 def get_epsilon_waam_vectorized(temps):
     """Vectorized version of get_epsilon_waam for numpy arrays."""
@@ -1185,10 +1142,14 @@ def update_temperatures_matrix(node_matrix, model, is_welding=False, arc_power=0
             
     # Update Table and BP nodes
     if node_matrix.table_grid is not None:
-        for i in node_matrix.table_indices:
-            mass = node_matrix.masses[i]
-            cp = get_cp_table(T[i])
-            new_T[i] += (Q_balance[i] * DT) / (mass * cp)
+        # Vectorized update for table nodes
+        table_indices = np.array(node_matrix.table_indices)
+        if len(table_indices) > 0:
+            T_table = T[table_indices]
+            cp_table = get_cp_table_vectorized(T_table)
+            masses_table = node_matrix.masses[table_indices]
+            new_T[table_indices] += (Q_balance[table_indices] * DT) / (masses_table * cp_table)
+            
     elif node_matrix.table_idx is not None:
         i = node_matrix.table_idx
         cp = get_cp_table(T[i])
@@ -1262,7 +1223,9 @@ def run_simulation():
         raise ValueError(f"DT ({DT}) must be > 0")
     
     # Check DT stability
-    alpha = LAMBDA_WAAM / (RHO_WAAM * CP_WAAM_A)
+    # Use Cp at room temperature for stability check
+    cp_ref = get_cp_waam(20.0)
+    alpha = LAMBDA_WAAM / (RHO_WAAM * cp_ref)
     dx_min = min(LAYER_HEIGHT, TRACK_WIDTH / max(N_ELEMENTS_PER_BEAD, 1))
     dt_max_stable = dx_min**2 / (2 * alpha)
     if DT > dt_max_stable:
