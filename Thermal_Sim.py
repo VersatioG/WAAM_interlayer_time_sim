@@ -940,7 +940,14 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
         h_neighbor = node_matrix.get_horizontal_neighbor(welding_node_idx, -1)
         if h_neighbor is not None:
             neighbors.append(h_neighbor)
-            contact_areas.append(TRACK_WIDTH * TRACK_OVERLAP * TRACK_LENGTH)
+            
+            # Fix: Use correct length for contact area (Element vs Bead)
+            if node_matrix.level_type[welding_node_idx] == TYPE_ELEMENT:
+                length = TRACK_LENGTH / node_matrix.num_elements_per_bead
+            else:
+                length = TRACK_LENGTH
+                
+            contact_areas.append(TRACK_WIDTH * TRACK_OVERLAP * length)
         
         # Vertical neighbor (layer below)
         v_neighbor = node_matrix.get_vertical_neighbor(welding_node_idx, -1)
@@ -1103,7 +1110,14 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
         h_right = node_matrix.get_horizontal_neighbor(i, +1)
         if h_right is not None:
             overlap_width = TRACK_WIDTH * TRACK_OVERLAP
-            contact_area = overlap_width * TRACK_LENGTH
+            
+            # Fix: Use correct length for contact area (Element vs Bead)
+            if node_matrix.level_type[i] == TYPE_ELEMENT:
+                length = TRACK_LENGTH / node_matrix.num_elements_per_bead
+            else:
+                length = TRACK_LENGTH
+                
+            contact_area = overlap_width * length
             dist = overlap_width
             q_horiz = LAMBDA_WAAM * contact_area / dist * (T[h_right] - T[i])
             Q_balance[i] += q_horiz
@@ -1231,7 +1245,7 @@ def run_simulation():
     # Determine smallest spatial dimension
     # 1. Layer height
     d_z = LAYER_HEIGHT
-    # 2. Effective bead width (smallest width due to overlap)
+    # 2. Effective bead width (distance between bead centers)
     d_y = TRACK_WIDTH * (1.0 - TRACK_OVERLAP)
     # 3. Element length (if elements are used)
     if N_LAYERS_WITH_ELEMENTS > 0 and N_ELEMENTS_PER_BEAD > 0:
@@ -1239,11 +1253,9 @@ def run_simulation():
     else:
         d_x = TRACK_LENGTH # Bead length
         
-    dx_min = min(d_x, d_y, d_z)
-    
-    # 3D Stability criterion: dt <= dx^2 / (factor * alpha)
-    # Factor 2 is for 1D, 4 for 2D, 6 for 3D. Using 6 for safety.
-    dt_max_stable = dx_min**2 / (6 * alpha)
+    # Rigorous 3D Stability criterion: dt <= 1 / (2 * alpha * (1/dx^2 + 1/dy^2 + 1/dz^2))
+    inv_sq_sum = (1.0/d_x**2) + (1.0/d_y**2) + (1.0/d_z**2)
+    dt_max_stable = 1.0 / (2.0 * alpha * inv_sq_sum)
     
     # Use local variable for simulation time step
     dt_sim = DT
