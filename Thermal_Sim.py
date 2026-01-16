@@ -47,7 +47,8 @@ WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 # --- Robot Logic ---
 # Robot_Wait = Base_Time + (Layer_Index * Factor)  # Linear
 # Or cubic: Robot_Wait = a + b*i + c*i^2 + d*i^3
-ROBOT_FIT_MODE = "cubic"  # "linear" or "cubic"
+# Or log: Robot_Wait = a + b * ln(i+1)
+ROBOT_FIT_MODE = "cubic"  # "linear", "cubic" or "log"
 
 # --- Geometry & Material: WAAM Wire ---
 MATERIAL_WAAM_NAME = "S235JR"
@@ -1578,6 +1579,9 @@ def linear_func(x, a, b):
 def cubic_func(x, a, b, c, d):
     return a + b * x + c * x**2 + d * x**3
 
+def log_func(x, a, b):
+    return a + b * np.log(x + 1)
+
 def main():
     # Print Time for reference
     print(dt.now().strftime("%d-%m-%Y %H:%M:%S"))
@@ -1608,8 +1612,15 @@ def main():
         a_opt, b_opt, c_opt, d_opt = popt
         fit_func = cubic_func
         fit_label = f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*i + {c_opt:.3f}*i² + {d_opt:.4f}*i³'
+    elif ROBOT_FIT_MODE == "log":
+        # Fit logarithmic: y = a + b * ln(i + 1)
+        # Constraint: constant term (a) >= 0
+        popt, _ = curve_fit(log_func, x_vals, y_vals, bounds=([0, -np.inf], [np.inf, np.inf]))
+        a_opt, b_opt = popt
+        fit_func = log_func
+        fit_label = f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*ln(i+1)'
     else:
-        raise ValueError("Invalid ROBOT_FIT_MODE. Choose 'linear' or 'cubic'.")
+        raise ValueError("Invalid ROBOT_FIT_MODE. Choose 'linear', 'cubic' or 'log'.")
     
     print("\n" + "="*40)
     print("RESULTS")
@@ -1633,6 +1644,11 @@ def main():
         print(f" >> b: {b_opt:.4f} s/Layer")
         print(f" >> c: {c_opt:.6f} s/Layer²")
         print(f" >> d: {d_opt:.8f} s/Layer³")
+    elif ROBOT_FIT_MODE == "log":
+        print("ROBOT PARAMETERS (Logarithmic Approximation):")
+        print(f"Formula: Wait time = a + b * ln(i+1)")
+        print(f" >> a: {a_opt:.4f} s")
+        print(f" >> b: {b_opt:.4f} s/log(Layer)")
     print("="*40)
 
     # --- Plots ---
