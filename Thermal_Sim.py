@@ -1,4 +1,5 @@
 import numpy as np
+from datetime import datetime as dt
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import curve_fit
@@ -11,7 +12,7 @@ from Material_Properties import get_material
 
 # --- Simulation Settings ---
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
-LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage and plotting overhead
+LOGGING_EVERY_N_STEPS = 20  # Log data every N time steps to reduce memory usage and plotting overhead
 
 # --- Discretization Settings (counted from top) ---
 # NOTE: Element-level discretization increases computational cost significantly.
@@ -20,16 +21,16 @@ LOGGING_EVERY_N_STEPS = 10  # Log data every N time steps to reduce memory usage
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
-N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
-N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
+N_LAYERS_AS_BEADS = 15       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 15  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_ELEMENTS_PER_BEAD = 57     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
-NUMBER_OF_LAYERS = 15
-LAYER_HEIGHT = 0.0023       # [m] (e.g., 2.4mm)
+NUMBER_OF_LAYERS = 15        # Total number of layers to be deposited (Reccomended to use +1 Layer for better results)
+LAYER_HEIGHT = 0.0032       # [m] (e.g., 2.4mm)
 
 # Track geometry
-TRACK_WIDTH = 0.0053         # [m] Width of a single weld track (bead width)
+TRACK_WIDTH = 0.0063         # [m] Width of a single weld track (bead width)
 TRACK_OVERLAP = 0.738        # Center distance ratio (Programmed distance / TRACK_WIDTH)
 NUMBER_OF_TRACKS = 5        # Number of parallel tracks per layer
 TRACK_LENGTH = 0.285         # [m] Length of each track
@@ -37,8 +38,8 @@ TRACK_LENGTH = 0.285         # [m] Length of each track
 # Process parameters
 PROCESS_SPEED = 0.010        # [m/s] Welding speed (travel speed)
 MELTING_TEMP = 1450.0       # [°C] Temperature at which the wire impacts
-INTERLAYER_TEMP = 200.0     # [°C] Max. temp of previous layer before starting next
-ARC_POWER = 4760.0          # [W] Total arc power during welding
+INTERLAYER_TEMP = 240.0     # [°C] Max. temp of previous layer before starting next
+ARC_POWER = 4740.0          # [W] Total arc power during welding
 ARC_POWER_CURRENT_FRACTION = 0.4  # Fraction of arc power going to current node (0.0-1.0)
 WIRE_FEED_RATE = 0.08       # [m/s] Wire feed rate (typical: 0.03-0.08 m/s)
 WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
@@ -50,8 +51,8 @@ ROBOT_FIT_MODE = "cubic"  # "linear" or "cubic"
 
 # --- Geometry & Material: WAAM Wire ---
 MATERIAL_WAAM_NAME = "S235JR"
-RHO_WAAM = 7800.0          # [kg/m^3] Density
-LAMBDA_WAAM = 45.0         # [W/(m K)] Thermal conductivity
+RHO_WAAM = 7850.0          # [kg/m^3] Density
+LAMBDA_WAAM = 43.0         # [W/(m K)] Thermal conductivity
 EPSILON_WAAM = 0.6         # Emissivity (solid)
 EPSILON_WAAM_LIQUID = 0.3  # Emissivity (liquid/molten)
 
@@ -63,7 +64,7 @@ BP_THICKNESS = 0.01        # [m]
 MATERIAL_BP_NAME = "S235JR"
 RHO_BP = 7850.0             # [kg/m^3]
 LAMBDA_BP = 45.0            # [W/(m K)]
-EPSILON_BP = 0.8            # Emissivity
+EPSILON_BP = 0.85           # Emissivity
 
 # --- Geometry & Material: Welding Table ---
 TABLE_LENGTH = 2           # [m]
@@ -73,7 +74,7 @@ TABLE_THICKNESS = 0.01     # [m]
 MATERIAL_TABLE_NAME = "S235JR"
 RHO_TABLE = 7850.0         # [kg/m^3]
 LAMBDA_TABLE = 45.0        # [W/(m K)]
-EPSILON_TABLE = 0.8        # Emissivity
+EPSILON_TABLE = 0.85       # Emissivity
 
 # --- Table Discretization Settings ---
 # TABLE_DISCRETIZATION_MODE controls how finely the table is subdivided:
@@ -82,15 +83,15 @@ EPSILON_TABLE = 0.8        # Emissivity
 #   Mode 2+: Each higher mode adds +1 to each dimension subdivision
 # The base plate is placed on one of the top corner nodes.
 # Validation: Each table node in X/Y direction must be >= BP dimensions
-TABLE_DISCRETIZATION_MODE = 1   # 0 = single node, 1+ = subdivided
+TABLE_DISCRETIZATION_MODE = 2   # 0 = single node, 1+ = subdivided
 N_TABLE_X = 3               # Base subdivisions along length (X) for Mode 1
 N_TABLE_Y = 2               # Base subdivisions along width (Y) for Mode 1
 N_TABLE_Z = 1               # Base subdivisions along thickness (Z) for Mode 1
 
 # --- Interaction & Environment ---
 AMBIENT_TEMP = 25.0        # [°C]
-CONTACT_BP_TABLE = BP_LENGTH * BP_WIDTH * 0.9    # [m^2] Area (Factor 0.9 for holes in Table)
-ALPHA_CONTACT = 600.0      # [W/(m^2 K)] Heat transfer coefficient contact between Base Plate and Table (Gap Conductance)
+CONTACT_BP_TABLE = BP_LENGTH * BP_WIDTH * 0.85    # [m^2] Area (Factor 0.9 for holes in Table)
+ALPHA_CONTACT = 300.0      # [W/(m^2 K)] Heat transfer coefficient contact between Base Plate and Table (Gap Conductance)
 STEFAN_BOLTZMANN = 5.67e-8 # [W/(m^2 K^4)]
 
 # =============================================================================
@@ -1578,6 +1579,8 @@ def cubic_func(x, a, b, c, d):
     return a + b * x + c * x**2 + d * x**3
 
 def main():
+    # Print Time for reference
+    print(dt.now().strftime("%d-%m-%Y %H:%M:%S"))
     # Run simulation
     t_data, layers_data, bp_data, table_data, waits = run_simulation()
     
