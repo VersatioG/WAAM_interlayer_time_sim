@@ -7,6 +7,10 @@ The code models temperature evolution in the welding setup (table, base plate, a
 ## Features
 
 - **Thermal Simulation**: Finite difference methods with Euler explicit time-stepping
+- **State Management & Resume**: Built-in capability to save simulation state and resume from interruptions
+  - Automatic parameter validation on resume
+  - Support for extending simulations (adjusting NUMBER_OF_LAYERS)
+  - Backup creation for safety
 - **High-Performance Vectorization**: Optimized using NumPy vectorization for radiation and temperature updates, significantly reducing computation time
 - **Dynamic Interlayer Waiting**: Always waits until target interlayer temperature is reached before depositing next layer
 - **Detailed Heat Transfer**: Conduction between components, radiation to environment, and arc power input during welding
@@ -56,37 +60,83 @@ The script will:
 
 ### Node Temperature Logging and 3D Visualization
 
-For detailed analysis, you can log all node temperatures at each timestep and visualize them in 3D:
+**Note:** The standalone `log_node_temperatures.py` has been removed. The state management functionality is now integrated directly into `Thermal_Sim.py`.
 
-#### Step 1: Run simulation with detailed logging
+### Simulation State Management and Resume Capability
 
-```bash
-python log_node_temperatures.py --output node_temps.h5 --layers 5
+The simulation now includes built-in state management that allows you to save progress and resume interrupted simulations. This is controlled by two new parameters in the INPUT BLOCK:
+
+#### Configuration
+
+```python
+# --- State Management & Logging ---
+LOGGING_MODE = 1           # 1 = plot only, 2 = log to file
+LOG_FILE_NAME = "simulation_state.pkl"  # State file for resume capability
 ```
 
-Options:
-- `--output, -o`: Output HDF5 file path (default: `node_temperatures.h5`)
-- `--layers, -l`: Number of layers to simulate (default: uses `NUMBER_OF_LAYERS` from config)
+- **LOGGING_MODE = 1**: Run simulation normally, plotting results at the end. No state file is created.
+- **LOGGING_MODE = 2**: Enable state management - saves simulation state after each layer to `LOG_FILE_NAME`.
 
-#### Step 2: Visualize in 3D
+#### How State Management Works
+
+1. **First Run with LOGGING_MODE = 2:**
+   - Simulation runs normally
+   - State is saved to file after each layer
+   - If interrupted, state file contains progress up to last completed layer
+
+2. **Resume from Saved State:**
+   - When you run again with LOGGING_MODE = 2, the simulation automatically:
+     - Checks if `LOG_FILE_NAME` exists
+     - Validates that input parameters haven't changed
+     - Resumes from the last completed layer
+     - Continues until `NUMBER_OF_LAYERS` is reached
+
+3. **Extending a Simulation:**
+   - You can increase `NUMBER_OF_LAYERS` to extend a completed simulation
+   - All other parameters must remain unchanged
+   - The simulation will continue from where it left off
+
+4. **Parameter Change Detection:**
+   - If any input parameter (except `NUMBER_OF_LAYERS`) changes, the simulation detects incompatibility
+   - A warning is displayed, and a new simulation starts from scratch
+   - The old state file is backed up automatically
+
+#### Example Workflow
 
 ```bash
-python visualize_nodes.py --file node_temps.h5
+# Initial run - simulate 10 layers
+# Set: NUMBER_OF_LAYERS = 10, LOGGING_MODE = 2
+python Thermal_Sim.py
+
+# Simulation interrupted at layer 7
+# State is saved in simulation_state.pkl
+
+# Resume the simulation
+# Same parameters, LOGGING_MODE = 2
+python Thermal_Sim.py
+# Resumes from layer 7, completes layers 8-10
+
+# Extend the simulation to 15 layers
+# Set: NUMBER_OF_LAYERS = 15, LOGGING_MODE = 2
+python Thermal_Sim.py
+# Continues from layer 10, adds layers 11-15
 ```
 
-Options:
-- `--file, -f`: Input HDF5 file (default: `node_temperatures.h5`)
-- `--colormap, -c`: Color scheme for temperature (default: `hot`). Options: `hot`, `jet`, `viridis`, `plasma`, etc.
-- `--temp-min`: Minimum temperature for color scale (default: auto)
-- `--temp-max`: Maximum temperature for color scale (default: auto)
-- `--backend`: Visualization library (`plotly`, `matplotlib`, or `auto`)
+#### Benefits
 
-The visualization shows:
-- Each thermal node as a 3D block at its physical position
-- Color-coded temperature (blue=cold, red=hot)
-- Interactive slider to navigate through timesteps
-- Hover tooltips with node details (Plotly backend)
-- Play/Pause animation button
+- **Robustness**: Recover from power failures, crashes, or manual interruptions
+- **Flexibility**: Extend simulations without re-running completed layers
+- **Efficiency**: Save time on long-running simulations
+- **Data Preservation**: Logged data (temperatures, wait times) is preserved and extended
+
+#### State File Contents
+
+The state file (`.pkl` format) contains:
+- All input parameters (for validation)
+- Current simulation time and layer index
+- Complete thermal state (temperatures, active nodes, etc.)
+- All logged data (time series, temperature histories)
+- Wait times for completed layers
 
 ### Configuration
 
@@ -262,15 +312,15 @@ The simulation is designed for high performance to allow for rapid parameter stu
 
 ## Output
 
-- **Console output**: Validation messages, simulation progress, fitted robot parameters
+- **Console output**: Validation messages, simulation progress, state management status, fitted robot parameters
 - **Plots**:
   - Temperature vs. time for all components (showing bead-level detail)
   - Welding table temperature shows maximum (hotspot) rather than average
   - Wait time per layer with linear/cubic fit
-- **HDF5 Data Files** (from `log_node_temperatures.py`):
-  - Timestep arrays
-  - Node metadata (positions, dimensions, types)
-  - Full temperature history for all nodes
+- **State Files** (when LOGGING_MODE = 2):
+  - `.pkl` files containing complete simulation state
+  - Includes all parameters, thermal state, and logged data
+  - Automatically managed with backup creation
 - **Interactive 3D Visualization** (from `visualize_nodes.py`):
   - HTML file with Plotly visualization (if using Plotly backend)
   - Matplotlib window with slider controls
@@ -279,12 +329,13 @@ The simulation is designed for high performance to allow for rapid parameter stu
 
 ```
 WAAM_interlayer_time_sim/
-├── Thermal_Sim.py           # Main simulation script
-├── log_node_temperatures.py  # Detailed node temperature logging
-├── visualize_nodes.py        # 3D visualization with timestep slider
-├── requirements.txt          # Python dependencies
-├── README.md                 # This documentation
-└── LICENSE                   # License file
+├── Thermal_Sim.py                # Main simulation script with integrated state management
+├── simulation_state_manager.py   # State save/load functionality for simulation resume
+├── Material_Properties.py        # Material property database and thermodynamic models
+├── visualize_nodes.py            # 3D visualization with timestep slider
+├── requirements.txt              # Python dependencies
+├── README.md                     # This documentation
+└── LICENSE                       # License file
 ```
 
 ## Limitations
