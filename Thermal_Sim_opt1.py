@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from scipy.optimize import curve_fit
 from scipy.integrate import quad
-from numba import jit
 from Material_Properties import get_material
 from simulation_state_manager import (
     create_state_manager,
@@ -930,56 +929,10 @@ class ThermalModel:
                                    BP_WIDTH * BP_THICKNESS)
 
 
-@jit(nopython=True, cache=True)
-def compute_waam_conduction_numba(active_indices, T, Q_balance, areas, level_types, bead_indices,
-                                   const_vert_cond, const_horiz_base, const_long_dist,
-                                   neighbors_v, neighbors_h, neighbors_l,
-                                   TRACK_WIDTH, TRACK_LENGTH, LAYER_HEIGHT, TYPE_ELEMENT):
-    """
-    Numba-optimized WAAM nodes conduction calculation.
-    Pre-computes neighbor indices outside this function for compatibility.
-    """
-    for idx in range(len(active_indices)):
-        i = active_indices[idx]
-        
-        # Vertical conduction
-        v_up = neighbors_v[idx]
-        if v_up >= 0:
-            area = areas[v_up]
-            q_vert = const_vert_cond * area * (T[v_up] - T[i])
-            Q_balance[i] += q_vert
-            Q_balance[v_up] -= q_vert
-        
-        # Horizontal conduction
-        h_right = neighbors_h[idx]
-        if h_right >= 0:
-            if level_types[i] == TYPE_ELEMENT:
-                length = const_long_dist
-            else:
-                length = TRACK_LENGTH
-            q_horiz = const_horiz_base * length * (T[h_right] - T[i])
-            Q_balance[i] += q_horiz
-            Q_balance[h_right] -= q_horiz
-        
-        # Longitudinal conduction
-        l_forward = neighbors_l[idx]
-        if l_forward >= 0:
-            if bead_indices[i] == 0:
-                bead_width = TRACK_WIDTH
-            else:
-                bead_width = TRACK_WIDTH * 0.738  # TRACK_OVERLAP hardcoded for Numba
-            area = bead_width * LAYER_HEIGHT
-            q_long = 43.0 * area / const_long_dist * (T[l_forward] - T[i])  # LAMBDA_WAAM hardcoded
-            Q_balance[i] += q_long
-            Q_balance[l_forward] -= q_long
-    
-    return Q_balance
-
-
 def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_power=0.0, welding_node_idx=None):
     """
     Update temperatures using NodeMatrix for efficient neighbor finding and radiation calculation.
-    OPTIMIZATION: Numba JIT compilation for hot path
+    OPTIMIZATION 1: Cache constants, reduce redundant calculations
     """
     num_nodes = len(node_matrix.temperatures)
     Q_balance = np.zeros(num_nodes, dtype=np.float64)
@@ -1156,75 +1109,77 @@ def update_temperatures_matrix(node_matrix, model, dt, is_welding=False, arc_pow
                 Q_balance[bp_idx] += q_vert
                 Q_balance[target_idx] -= q_vert
     
-    # WAAM nodes conduction - NUMBA OPTIMIZED
+    # WAAM nodes conduction
     # OPTIMIZATION: Precompute conduction constants for WAAM nodes
     const_vert_cond = CONST_LAMBDA_WAAM / LAYER_HEIGHT
     const_horiz_dist = TRACK_WIDTH * TRACK_OVERLAP
     const_horiz_base = CONST_LAMBDA_WAAM * LAYER_HEIGHT / const_horiz_dist
     const_long_dist = TRACK_LENGTH / node_matrix.num_elements_per_bead
     
-    # OPT2: Pre-extract arrays to reduce attribute lookups
-    level_types = node_matrix.level_type
-    bead_indices = node_matrix.bead_idx
-    areas = node_matrix.areas
-    
-    # Precompute all neighbor indices for Numba (cannot call methods inside JIT)
-    neighbors_v = np.full(len(active_waam_indices_list), -1, dtype=np.int32)
-    neighbors_h = np.full(len(active_waam_indices_list), -1, dtype=np.int32)
-    neighbors_l = np.full(len(active_waam_indices_list), -1, dtype=np.int32)
-    
-    for idx, i in enumerate(active_waam_indices_list):
-        v = node_matrix.get_vertical_neighbor(i, +1)
-        if v is not None:
-            pair_key = (min(i, v), max(i, v))
+    for i in active_waam_indices_list:
+        # Vertical conduction
+        cross_info = node_matrix.get_cross_level_vertical_info(i, +1)
+        transfer_type = cross_info['type']
+        
+        if transfer_type == 'to_baseplate': pass
+        elif transfer_type == 'none' or transfer_type is None: pass
+        elif transfer_type == 'same':
+            v_up = cross_info['target_nodes'][0]
+            pair_key = (min(i, v_up), max(i, v_up))
             if pair_key not in processed_pairs:
                 processed_pairs.add(pair_key)
-                neighbors_v[idx] = v
+                # OPTIMIZATION: Use precomputed constant
+                area = node_matrix.areas[v_up]
+                q_vert = const_vert_cond * area * (T[v_up] - T[i])
+                Q_balance[i] += q_vert
+                Q_balance[v_up] -= q_vert
+        elif transfer_type in ['element_to_bead', 'bead_to_layer', 'element_to_layer']:
+            target_nodes = cross_info['target_nodes']
+            if target_nodes:
+                target_idx = target_nodes[0]
+                # OPTIMIZATION: Use precomputed constant
+                area = node_matrix.areas[i]
+                q_vert = const_vert_cond * area * (T[target_idx] - T[i])
+                Q_balance[i] += q_vert
+                Q_balance[target_idx] -= q_vert
+        elif transfer_type in ['bead_to_element', 'layer_to_bead', 'layer_to_element']:
+            target_nodes = cross_info['target_nodes']
+            if target_nodes:
+                for target_idx in target_nodes:
+                    pair_key = (min(i, target_idx), max(i, target_idx))
+                    if pair_key not in processed_pairs:
+                        processed_pairs.add(pair_key)
+                        # OPTIMIZATION: Use precomputed constant
+                        area = node_matrix.areas[target_idx]
+                        q_vert = const_vert_cond * area * (T[target_idx] - T[i])
+                        Q_balance[i] += q_vert
+                        Q_balance[target_idx] -= q_vert
         
-        h = node_matrix.get_horizontal_neighbor(i, +1)
-        if h is not None:
-            neighbors_h[idx] = h
+        # Horizontal conduction
+        h_right = node_matrix.get_horizontal_neighbor(i, +1)
+        if h_right is not None:
+            # OPTIMIZATION: Precompute based on element type
+            if node_matrix.level_type[i] == TYPE_ELEMENT:
+                length = const_long_dist
+            else:
+                length = TRACK_LENGTH
+                
+            # OPTIMIZATION: Use precomputed base constant
+            contact_area = length * LAYER_HEIGHT
+            q_horiz = const_horiz_base * length * (T[h_right] - T[i])
+            Q_balance[i] += q_horiz
+            Q_balance[h_right] -= q_horiz
         
-        l = node_matrix.get_longitudinal_neighbor(i, +1)
-        if l is not None:
-            neighbors_l[idx] = l
-    
-    # Call Numba-optimized function
-    if len(active_indices_arr) > 0:
-        Q_balance = compute_waam_conduction_numba(
-            active_indices_arr, T, Q_balance, areas, level_types, bead_indices,
-            const_vert_cond, const_horiz_base, const_long_dist,
-            neighbors_v, neighbors_h, neighbors_l,
-            TRACK_WIDTH, TRACK_LENGTH, LAYER_HEIGHT, TYPE_ELEMENT
-        )
-    
-    # Handle cross-level transfers (edge cases not in Numba)
-    for i in active_waam_indices_list:
-        v_up = node_matrix.get_vertical_neighbor(i, +1)
-        if v_up is None:
-            # Handle cross-level transfers
-            cross_info = node_matrix.get_cross_level_vertical_info(i, +1)
-            transfer_type = cross_info['type']
-            
-            if transfer_type in ['element_to_bead', 'bead_to_layer', 'element_to_layer']:
-                target_nodes = cross_info['target_nodes']
-                if target_nodes:
-                    target_idx = target_nodes[0]
-                    area = areas[i]
-                    q_vert = const_vert_cond * area * (T[target_idx] - T[i])
-                    Q_balance[i] += q_vert
-                    Q_balance[target_idx] -= q_vert
-            elif transfer_type in ['bead_to_element', 'layer_to_bead', 'layer_to_element']:
-                target_nodes = cross_info['target_nodes']
-                if target_nodes:
-                    for target_idx in target_nodes:
-                        pair_key = (min(i, target_idx), max(i, target_idx))
-                        if pair_key not in processed_pairs:
-                            processed_pairs.add(pair_key)
-                            area = areas[target_idx]
-                            q_vert = const_vert_cond * area * (T[target_idx] - T[i])
-                            Q_balance[i] += q_vert
-                            Q_balance[target_idx] -= q_vert
+        # Longitudinal conduction
+        l_forward = node_matrix.get_longitudinal_neighbor(i, +1)
+        if l_forward is not None:
+            # OPTIMIZATION: Use precomputed element_length
+            bead_width = (TRACK_WIDTH if node_matrix.bead_idx[i] == 0 else TRACK_WIDTH * TRACK_OVERLAP)
+            area = bead_width * LAYER_HEIGHT
+            # OPTIMIZATION: Precompute conductance constant
+            q_long = CONST_LAMBDA_WAAM * area / const_long_dist * (T[l_forward] - T[i])
+            Q_balance[i] += q_long
+            Q_balance[l_forward] -= q_long
             
     # --- Temperature Update ---
     new_T = T.copy()
