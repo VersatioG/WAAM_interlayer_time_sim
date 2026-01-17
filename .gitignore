@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# State files
+*.pkl
+*.backup
+
+# Test outputs
+test_*.py
+debug.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Simulation outputs (optional - uncomment if you don't want to track these)
+# *.h5
+# node_temperatures.h5

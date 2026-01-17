@@ -5,6 +5,12 @@ from tqdm import tqdm
 from scipy.optimize import curve_fit
 from scipy.integrate import quad
 from Material_Properties import get_material
+from simulation_state_manager import (
+    check_state_file_compatibility,
+    create_state_from_node_matrix,
+    restore_node_matrix_from_state,
+    save_simulation_state
+)
 
 # =============================================================================
 # INPUT BLOCK (Adjust values here)
@@ -12,7 +18,8 @@ from Material_Properties import get_material
 
 # --- Simulation Settings ---
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
-LOGGING_EVERY_N_STEPS = 20  # Log data every N time steps to reduce memory usage and plotting overhead
+LOGGING_FREQUENCY = 1.0  # [s] How often to log data for plotting
+LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N time steps (minimum 1 to prevent division by zero)
 
 # --- Discretization Settings (counted from top) ---
 # NOTE: Element-level discretization increases computational cost significantly.
@@ -94,6 +101,18 @@ AMBIENT_TEMP = 25.0        # [°C]
 CONTACT_BP_TABLE = BP_LENGTH * BP_WIDTH * 0.85    # [m^2] Area (Factor 0.9 for holes in Table)
 ALPHA_CONTACT = 300.0      # [W/(m^2 K)] Heat transfer coefficient contact between Base Plate and Table (Gap Conductance)
 STEFAN_BOLTZMANN = 5.67e-8 # [W/(m^2 K^4)]
+
+# --- State Management & Logging ---
+# LOGGING_MODE: Controls how simulation data is handled
+#   1 = Plot only (no state file logging)
+#   2 = Log to file (enables simulation resume capability)
+LOGGING_MODE = 1           # 1 = plot only, 2 = log to file
+
+# LOG_FILE_NAME: Filename for saving/loading simulation state
+# Only used when LOGGING_MODE = 2
+# If file exists and parameters match, simulation will resume from saved state
+# Exception: NUMBER_OF_LAYERS can be changed to extend or shorten simulation
+LOG_FILE_NAME = "simulation_state.pkl"  # State file for resume capability
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -1261,6 +1280,7 @@ def run_simulation():
     # Rigorous 3D Stability criterion: dt <= 1 / (2 * alpha * (1/dx^2 + 1/dy^2 + 1/dz^2))
     inv_sq_sum = (1.0/d_x**2) + (1.0/d_y**2) + (1.0/d_z**2)
     dt_max_stable = 1.0 / (2.0 * alpha * inv_sq_sum)
+    dx_min = min(d_x, d_y, d_z)
     
     # Use local variable for simulation time step
     dt_sim = DT
@@ -1378,6 +1398,44 @@ def run_simulation():
     
     current_time = 0.0
     logging_counter = 0
+    start_layer = 0  # Layer to start/resume from
+    
+    # --- State Management: Check for existing state file ---
+    resume_from_state = False
+    if LOGGING_MODE == 2:
+        print(f"\nState logging enabled. Checking for existing state file: {LOG_FILE_NAME}")
+        compatible, saved_state, differences = check_state_file_compatibility(LOG_FILE_NAME)
+        
+        if saved_state is not None:
+            if compatible:
+                print("✓ Compatible state file found. Resuming simulation...")
+                
+                # Check if NUMBER_OF_LAYERS changed
+                saved_layers = saved_state.parameters.get('NUMBER_OF_LAYERS', 0)
+                if saved_layers != NUMBER_OF_LAYERS:
+                    if NUMBER_OF_LAYERS > saved_layers:
+                        print(f"  Extending simulation: {saved_layers} → {NUMBER_OF_LAYERS} layers")
+                    else:
+                        print(f"  Shortening simulation: {saved_layers} → {NUMBER_OF_LAYERS} layers")
+                
+                # Restore state
+                restore_node_matrix_from_state(saved_state, node_matrix)
+                current_time = saved_state.current_time
+                start_layer = saved_state.current_layer
+                logging_counter = saved_state.logging_counter
+                time_log = saved_state.time_log
+                temp_layers_log = saved_state.temp_layers_log
+                temp_bp_log = saved_state.temp_bp_log
+                temp_table_log = saved_state.temp_table_log
+                wait_times = saved_state.wait_times
+                
+                resume_from_state = True
+                print(f"  Resuming from layer {start_layer}, time {current_time:.1f}s")
+            else:
+                print("✗ Incompatible state file (parameters changed). Starting new simulation.")
+                print("  To resume, please revert parameters to match saved state.")
+        else:
+            print("No existing state file. Starting new simulation.")
     
     # Calculate wire melting power
     power_wire_melting = calculate_wire_melting_power(
@@ -1397,8 +1455,11 @@ def run_simulation():
     print(f"Max stable DT: {dt_max_stable:.4f} s (using {dt_sim:.4f} s)")
     print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
     
+    if resume_from_state:
+        print(f"Resuming from layer {start_layer + 1}/{NUMBER_OF_LAYERS}")
+    
     # Main simulation loop
-    for i_layer in tqdm(range(NUMBER_OF_LAYERS)):
+    for i_layer in tqdm(range(start_layer, NUMBER_OF_LAYERS), desc="Simulating layers", initial=start_layer, total=NUMBER_OF_LAYERS):
         
         # Dynamic discretization: based on current number of layers (i_layer + 1)
         # The current layer being deposited is always the "top" layer
@@ -1541,6 +1602,14 @@ def run_simulation():
                 current_level = node_matrix.get_layer_level_type(layer_idx)
                 if current_level == 'bead' or current_level == 'element':
                     node_matrix.consolidate_layer_to_layer(layer_idx)
+        
+        # --- State Management: Save state after each layer ---
+        if LOGGING_MODE == 2:
+            state = create_state_from_node_matrix(
+                node_matrix, current_time, i_layer + 1, logging_counter,
+                time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
+            )
+            save_simulation_state(state, LOG_FILE_NAME)
     
     return time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
 
