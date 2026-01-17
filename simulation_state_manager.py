@@ -322,21 +322,27 @@ def create_state_from_node_matrix(node_matrix, current_time, current_layer,
 def restore_node_matrix_from_state(state, node_matrix):
     """
     Restore NodeMatrix object from saved state.
+    Handles cases where the node_matrix size may differ (e.g., when extending simulation).
     
     Args:
         state: SimulationState object
         node_matrix: NodeMatrix object to restore into
     """
-    # Restore arrays
-    node_matrix.temperatures[:] = state.temperatures
-    node_matrix.active_mask[:] = state.active_mask
-    node_matrix.layer_idx[:] = state.layer_idx
-    node_matrix.bead_idx[:] = state.bead_idx
-    node_matrix.element_idx[:] = state.element_idx
-    node_matrix.level_type[:] = state.level_type
-    node_matrix.masses[:] = state.masses
-    node_matrix.areas[:] = state.areas
-    node_matrix.radiation_areas[:] = state.radiation_areas
+    # Determine the size to copy (minimum of saved and current)
+    saved_size = len(state.temperatures)
+    current_size = len(node_matrix.temperatures)
+    copy_size = min(saved_size, current_size)
+    
+    # Restore arrays (only up to the saved size)
+    node_matrix.temperatures[:copy_size] = state.temperatures[:copy_size]
+    node_matrix.active_mask[:copy_size] = state.active_mask[:copy_size]
+    node_matrix.layer_idx[:copy_size] = state.layer_idx[:copy_size]
+    node_matrix.bead_idx[:copy_size] = state.bead_idx[:copy_size]
+    node_matrix.element_idx[:copy_size] = state.element_idx[:copy_size]
+    node_matrix.level_type[:copy_size] = state.level_type[:copy_size]
+    node_matrix.masses[:copy_size] = state.masses[:copy_size]
+    node_matrix.areas[:copy_size] = state.areas[:copy_size]
+    node_matrix.radiation_areas[:copy_size] = state.radiation_areas[:copy_size]
     
     # Restore active indices
     node_matrix.active_waam_indices = state.active_waam_indices.copy()
