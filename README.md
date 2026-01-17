@@ -8,9 +8,10 @@ The code models temperature evolution in the welding setup (table, base plate, a
 
 - **Thermal Simulation**: Finite difference methods with Euler explicit time-stepping
 - **State Management & Resume**: Built-in capability to save simulation state and resume from interruptions
-  - Automatic parameter validation on resume
-  - Support for extending simulations (adjusting NUMBER_OF_LAYERS)
-  - Backup creation for safety
+  - **HDF5 Logging**: Continuous, crash-safe logging to .h5 files
+  - Partial layer handling: Automatically rolls back to the last completed layer on resume
+  - Parameter validation: Ensures compatibility between saved state and current configuration
+  - Extension support: Seamlessly extend simulations by increasing NUMBER_OF_LAYERS
 - **High-Performance Vectorization**: Optimized using NumPy vectorization for radiation and temperature updates, significantly reducing computation time
 - **Dynamic Interlayer Waiting**: Always waits until target interlayer temperature is reached before depositing next layer
 - **Detailed Heat Transfer**: Conduction between components, radiation to environment, and arc power input during welding

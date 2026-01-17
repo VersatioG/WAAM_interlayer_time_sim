@@ -6,10 +6,8 @@ from scipy.optimize import curve_fit
 from scipy.integrate import quad
 from Material_Properties import get_material
 from simulation_state_manager import (
-    check_state_file_compatibility,
-    create_state_from_node_matrix,
-    restore_node_matrix_from_state,
-    save_simulation_state
+    create_state_manager,
+    extract_parameters_from_globals
 )
 
 # =============================================================================
@@ -18,7 +16,7 @@ from simulation_state_manager import (
 
 # --- Simulation Settings ---
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
-LOGGING_FREQUENCY = 1.0  # [s] How often to log data for plotting
+LOGGING_FREQUENCY = 0.5  # [s] How often to log data for plotting
 LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N time steps (minimum 1 to prevent division by zero)
 
 # --- Discretization Settings (counted from top) ---
@@ -28,8 +26,8 @@ LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N 
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 15       # Number of top layers modeled as individual beads (default: 2)
-N_LAYERS_WITH_ELEMENTS = 15  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
 N_ELEMENTS_PER_BEAD = 57     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
@@ -106,13 +104,13 @@ STEFAN_BOLTZMANN = 5.67e-8 # [W/(m^2 K^4)]
 # LOGGING_MODE: Controls how simulation data is handled
 #   1 = Plot only (no state file logging)
 #   2 = Log to file (enables simulation resume capability)
-LOGGING_MODE = 1           # 1 = plot only, 2 = log to file
+LOGGING_MODE = 2           # 1 = plot only, 2 = log to file
 
-# LOG_FILE_NAME: Filename for saving/loading simulation state
+# LOG_FILE_NAME: Filename for saving/loading simulation state (HDF5 format)
 # Only used when LOGGING_MODE = 2
 # If file exists and parameters match, simulation will resume from saved state
 # Exception: NUMBER_OF_LAYERS can be changed to extend or shorten simulation
-LOG_FILE_NAME = "simulation_state.pkl"  # State file for resume capability
+LOG_FILE_NAME = "simulation_state.h5"  # State file for resume capability
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -1399,43 +1397,96 @@ def run_simulation():
     current_time = 0.0
     logging_counter = 0
     start_layer = 0  # Layer to start/resume from
+    state_manager = None
     
     # --- State Management: Check for existing state file ---
     resume_from_state = False
+    
     if LOGGING_MODE == 2:
-        print(f"\nState logging enabled. Checking for existing state file: {LOG_FILE_NAME}")
-        compatible, saved_state, differences = check_state_file_compatibility(LOG_FILE_NAME)
+        # Collect parameters for validation
+        current_params = extract_parameters_from_globals(globals())
+        # Use node_matrix.max_nodes instead of max_waam_nodes to include Table and BP nodes
+        state_manager = create_state_manager(LOG_FILE_NAME, current_params, node_matrix.max_nodes)
         
-        if saved_state is not None:
-            if compatible:
-                print("✓ Compatible state file found. Resuming simulation...")
-                
-                # Check if NUMBER_OF_LAYERS changed
-                saved_layers = saved_state.parameters.get('NUMBER_OF_LAYERS', 0)
-                if saved_layers != NUMBER_OF_LAYERS:
-                    if NUMBER_OF_LAYERS > saved_layers:
-                        print(f"  Extending simulation: {saved_layers} → {NUMBER_OF_LAYERS} layers")
-                    else:
-                        print(f"  Shortening simulation: {saved_layers} → {NUMBER_OF_LAYERS} layers")
-                
-                # Restore state
-                restore_node_matrix_from_state(saved_state, node_matrix)
-                current_time = saved_state.current_time
-                start_layer = saved_state.current_layer
-                logging_counter = saved_state.logging_counter
-                time_log = saved_state.time_log
-                temp_layers_log = saved_state.temp_layers_log
-                temp_bp_log = saved_state.temp_bp_log
-                temp_table_log = saved_state.temp_table_log
-                wait_times = saved_state.wait_times
-                
-                resume_from_state = True
-                print(f"  Resuming from layer {start_layer}, time {current_time:.1f}s")
-            else:
-                print("✗ Incompatible state file (parameters changed). Starting new simulation.")
-                print("  To resume, please revert parameters to match saved state.")
-        else:
-            print("No existing state file. Starting new simulation.")
+        start_layer, resume_state = state_manager.initialize_or_load()
+        
+        if resume_state is not None:
+             print(f"✓ Resuming simulation from Layer {start_layer}...")
+             
+             # Restore Node Matrix State
+             # We can't use restore_node_matrix_from_state anymore as it expected the old object
+             # We do it manually here using the dict
+             
+             # 1. Arrays (Assumes valid padding done by manager)
+             # Determine active count from mask or just copy all
+             node_matrix.temperatures[:] = resume_state['temperatures']
+             node_matrix.active_mask[:] = resume_state['active_mask']
+             node_matrix.radiation_areas[:] = resume_state['radiation_areas']
+             
+             # Restore scalar state
+             current_time = resume_state['time']
+             
+             # For other arrays (masses, areas, indices), they are re-calculated dynamically 
+             # OR we need to trust they are static/deterministic based on layer structure.
+             # Wait! 'masses', 'areas', 'level_type', 'layer_idx', 'bead_idx' are setup during activation.
+             # If we resume, we skipped the activation calls for previous layers!
+             # CRITICAL: We must re-run the activation logic for the PAST layers to populate 
+             # the static properties (mass, area, indices) correctly, 
+             # BUT without running the thermal updates.
+             
+             print("  Re-initializing past node properties...")
+             # Re-run structure initialization for past layers (0 to start_layer - 1)
+             for r_layer in range(start_layer):
+                 # Logic must match the main loop structure exactly
+                 use_beads = N_LAYERS_AS_BEADS >= 1 # Logic: Past layers are consolidated anyway
+                 
+                 # NOTE: Resume logic implies we assume the previous layers are fully consolidated?
+                 # OR do we keep them in their historical state?
+                 # If we just load T, mask, etc, we are fine, BUT 'masses' and 'level_type' are 0/Inactive.
+                 
+                 # We simply need to "replay" the activations.
+                 # Since we pruned partial layers, the state is at the END of start_layer-1.
+                 # This means all layers < start_layer are fully done.
+                 # They should be in their consolidated state (if consolidation happened).
+                 
+                 # IF consolidation happened, we need to know that.
+                 # The 'active_mask' from file tells us WHICH nodes are active.
+                 # We can iterate over all nodes, check if active in file, and set their properties?
+                 # But we don't store mass/area/type in HDF5 (to save space, assuming deterministic).
+                 
+                 # PROBLEM: If we don't store static props, we must re-calculate them.
+                 # We can loop through all potential nodes for past layers.
+                 # If active_mask[i] is True, we need to set its type/mass/area.
+                 # But we don't know if it's a bead or layer or element just from index 
+                 # (well technically we do if mapping is deterministic, which it is).
+                 
+                 # Reconstruct simulation structure:
+                 # We can just run the loop from 0 to start_layer-1 in "setup-only" mode.
+                 pass
+
+             # Actually, re-running the loop logic IS the best way to ensure consistency.
+             # We need to know if consolidation happened.
+             # The dynamic consolidation logic depends on N_LAYERS_WITH_ELEMENTS/N_LAYERS_AS_BEADS relative to the TOP.
+             # When we were at layer X, we consolidated X-N.
+             # At the resume point (start_layer), the structure should reflect what it was when start_layer-1 finished.
+             # Which effectively means standard consolidation rules applied at step start_layer-1.
+             
+             # Strategy:
+             # Fast-forward the loop from 0 to start_layer.
+             # For each step, perform activations and consolidations, but SKIP thermal updates and logging.
+             # At the end, simply OVERWRITE temperatures/active_mask/radiation_areas with the values from file.
+             # This ensures geometry/topology is correct (from deterministic replay) 
+             # and thermal state is exact (from file).
+             
+             resume_from_state = True
+             if 'wait_times' in resume_state:
+                 wait_times = resume_state['wait_times']
+             
+             if 'history' in resume_state:
+                 time_log = resume_state['history']['time']
+                 temp_layers_log = resume_state['history']['layers']
+                 temp_bp_log = resume_state['history']['bp']
+                 temp_table_log = resume_state['history']['table']
     
     # Calculate wire melting power
     power_wire_melting = calculate_wire_melting_power(
@@ -1456,10 +1507,13 @@ def run_simulation():
     print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
     
     if resume_from_state:
-        print(f"Resuming from layer {start_layer + 1}/{NUMBER_OF_LAYERS}")
+        print(f"Replaying geometry for {start_layer} layers...")
     
     # Main simulation loop
-    for i_layer in tqdm(range(start_layer, NUMBER_OF_LAYERS), desc="Simulating layers", initial=start_layer, total=NUMBER_OF_LAYERS):
+    # We iterate from 0 to ensure geometry state is correctly rebuilt if resuming
+    for i_layer in tqdm(range(NUMBER_OF_LAYERS), desc="Simulating layers", initial=0, total=NUMBER_OF_LAYERS):
+        
+        is_replay = i_layer < start_layer
         
         # Dynamic discretization: based on current number of layers (i_layer + 1)
         # The current layer being deposited is always the "top" layer
@@ -1489,8 +1543,31 @@ def run_simulation():
                             temperature=MELTING_TEMP
                         )
                         
-                        # Simulate welding of this element
-                        steps = int(element_duration / dt_sim)
+                        if not is_replay:
+                            # Simulate welding of this element
+                            steps = int(element_duration / dt_sim)
+                            for _ in range(steps):
+                                node_matrix = update_temperatures_matrix(
+                                    node_matrix, thermal_model, dt=dt_sim, is_welding=True,
+                                    arc_power=effective_arc_power, welding_node_idx=welding_node_idx
+                                )
+                                current_time += dt_sim
+                                
+                                logging_counter += 1
+                                if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                                    sm = log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                                    if state_manager: state_manager.log_step(current_time, i_layer, node_matrix, sm)
+                else:
+                    # Bead-level: add whole bead
+                    welding_node_idx = node_matrix.activate_waam_node(
+                        layer_idx=i_layer, bead_idx=i_bead, element_idx=-1,
+                        level_type_str='bead', mass=bead_mass, area=bead_area,
+                        temperature=MELTING_TEMP
+                    )
+                    
+                    if not is_replay:
+                        # Simulate welding of this bead
+                        steps = int(bead_duration / dt_sim)
                         for _ in range(steps):
                             node_matrix = update_temperatures_matrix(
                                 node_matrix, thermal_model, dt=dt_sim, is_welding=True,
@@ -1500,27 +1577,8 @@ def run_simulation():
                             
                             logging_counter += 1
                             if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
-                else:
-                    # Bead-level: add whole bead
-                    welding_node_idx = node_matrix.activate_waam_node(
-                        layer_idx=i_layer, bead_idx=i_bead, element_idx=-1,
-                        level_type_str='bead', mass=bead_mass, area=bead_area,
-                        temperature=MELTING_TEMP
-                    )
-                    
-                    # Simulate welding of this bead
-                    steps = int(bead_duration / dt_sim)
-                    for _ in range(steps):
-                        node_matrix = update_temperatures_matrix(
-                            node_matrix, thermal_model, dt=dt_sim, is_welding=True,
-                            arc_power=effective_arc_power, welding_node_idx=welding_node_idx
-                        )
-                        current_time += dt_sim
-                        
-                        logging_counter += 1
-                        if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                            log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                                sm = log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                                if state_manager: state_manager.log_step(current_time, i_layer, node_matrix, sm)
         else:
             # Layer-level: add entire layer as single node
             layer_node_idx = node_matrix.activate_waam_node(
@@ -1529,54 +1587,73 @@ def run_simulation():
                 temperature=MELTING_TEMP
             )
             
-            # Simulate entire layer deposition
-            steps = int(layer_duration / dt_sim)
-            for _ in range(steps):
+            if not is_replay:
+                # Simulate entire layer deposition
+                steps = int(layer_duration / dt_sim)
+                for _ in range(steps):
+                    node_matrix = update_temperatures_matrix(
+                        node_matrix, thermal_model, dt=dt_sim, is_welding=True,
+                        arc_power=effective_arc_power, welding_node_idx=layer_node_idx
+                    )
+                    current_time += dt_sim
+                    
+                    logging_counter += 1
+                    if logging_counter % LOGGING_EVERY_N_STEPS == 0:
+                        sm = log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                        if state_manager: state_manager.log_step(current_time, i_layer, node_matrix, sm)
+        if is_replay and i_layer == start_layer - 1:
+            # We just finished replaying geometry for the last done layer.
+            # Now we MUST restore the thermal state from file before moving to next layer (which is live).
+            print(f"  Replay complete. Applying thermal state from file...")
+            node_matrix.temperatures[:] = resume_state['temperatures']
+            node_matrix.active_mask[:] = resume_state['active_mask']
+            node_matrix.radiation_areas[:] = resume_state['radiation_areas']
+            current_time = resume_state['time']
+            # Replay done, loop continues to cooling? 
+            # NO, the saved state is typically at the BEGINNING of next layer?
+            # Wait, my state manager logic: "Resuming simulation at start of Layer X". 
+            # The saved state is the LAST frame of Layer X-1 (after cooling).
+            # So if we are at i_layer = start_layer - 1, we are exactly where we need to be.
+            # We skip the cooling loop because the state ALREADY includes the cooling.
+            pass
+        
+        # Cool until interpass temperature reached
+        if not is_replay:
+            time_start_wait = current_time
+        
+            while True:
+                # Get max temperature of current layer
+                current_layer_nodes = node_matrix.get_nodes_in_layer(i_layer)
+                if current_layer_nodes:
+                    t_hottest = max(node_matrix.temperatures[i] for i in current_layer_nodes)
+                else:
+                    t_hottest = AMBIENT_TEMP
+                
+                condition_met = t_hottest <= INTERLAYER_TEMP
+                
+                if condition_met:
+                    break
+                
+                # Safety check for instability
+                if t_hottest > 5000.0:
+                    print(f"Warning: Instability detected (T={t_hottest:.1f}°C). Breaking cooling loop.")
+                    break
+
                 node_matrix = update_temperatures_matrix(
-                    node_matrix, thermal_model, dt=dt_sim, is_welding=True,
-                    arc_power=effective_arc_power, welding_node_idx=layer_node_idx
+                    node_matrix, thermal_model, dt=dt_sim, is_welding=False
                 )
                 current_time += dt_sim
                 
                 logging_counter += 1
                 if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                    log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
-        
-        # Cool until interpass temperature reached
-        time_start_wait = current_time
-        
-        while True:
-            # Get max temperature of current layer
-            current_layer_nodes = node_matrix.get_nodes_in_layer(i_layer)
-            if current_layer_nodes:
-                t_hottest = max(node_matrix.temperatures[i] for i in current_layer_nodes)
-            else:
-                t_hottest = AMBIENT_TEMP
+                    sm = log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
+                    if state_manager: state_manager.log_step(current_time, i_layer, node_matrix, sm)
             
-            condition_met = t_hottest <= INTERLAYER_TEMP
-            
-            if condition_met:
-                break
-            
-            # Safety check for instability
-            if t_hottest > 5000.0:
-                print(f"Warning: Instability detected (T={t_hottest:.1f}°C). Breaking cooling loop.")
-                break
-
-            node_matrix = update_temperatures_matrix(
-                node_matrix, thermal_model, dt=dt_sim, is_welding=False
-            )
-            current_time += dt_sim
-            
-            logging_counter += 1
-            if logging_counter % LOGGING_EVERY_N_STEPS == 0:
-                log_data(current_time, node_matrix, time_log, temp_layers_log, temp_bp_log, temp_table_log)
-        
-        wait_times.append(current_time - time_start_wait)
+            wait_time_val = current_time - time_start_wait
+            wait_times.append(wait_time_val)
         
         # Dynamic consolidation based on current layer count
-        # Elements → Beads: for layers beyond N_LAYERS_WITH_ELEMENTS from top
-        # Beads → Layer: for layers beyond N_LAYERS_AS_BEADS from top
+        # (This runs for BOTH replay and simulation to maintain correct matrix structure)
         
         current_num_layers = i_layer + 1
         
@@ -1603,14 +1680,14 @@ def run_simulation():
                 if current_level == 'bead' or current_level == 'element':
                     node_matrix.consolidate_layer_to_layer(layer_idx)
         
-        # --- State Management: Save state after each layer ---
-        if LOGGING_MODE == 2:
-            state = create_state_from_node_matrix(
-                node_matrix, current_time, i_layer + 1, logging_counter,
-                time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
-            )
-            save_simulation_state(state, LOG_FILE_NAME)
+        # --- State Management: Mark layer complete ---
+        if not is_replay and state_manager:
+            wait_val = wait_times[-1] if wait_times else 0.0
+            state_manager.mark_layer_complete(i_layer, wait_val)
     
+    if state_manager:
+        state_manager.close()
+
     return time_log, temp_layers_log, temp_bp_log, temp_table_log, wait_times
 
 def log_data(t, node_matrix, t_log, layers_log, bp_log, temp_table_log):
@@ -1623,20 +1700,30 @@ def log_data(t, node_matrix, t_log, layers_log, bp_log, temp_table_log):
     for layer_idx in range(top_layer_idx + 1):
         nodes_in_layer = node_matrix.get_nodes_in_layer(layer_idx)
         if nodes_in_layer:
-            max_temp = max(node_matrix.temperatures[i] for i in nodes_in_layer)
+            max_temp = float(max(node_matrix.temperatures[i] for i in nodes_in_layer))
             layer_temps.append(max_temp)
     
     layers_log.append(layer_temps)
-    bp_log.append(node_matrix.temperatures[node_matrix.bp_idx] if node_matrix.bp_idx is not None else AMBIENT_TEMP)
+    
+    bp_temp = float(node_matrix.temperatures[node_matrix.bp_idx] if node_matrix.bp_idx is not None else AMBIENT_TEMP)
+    bp_log.append(bp_temp)
     
     # For table temperature, use max if multi-node or single value
     if node_matrix.table_indices and len(node_matrix.table_indices) > 1:
-        table_max = max(node_matrix.temperatures[i] for i in node_matrix.table_indices)
-        temp_table_log.append(table_max)
+        table_temp = float(max(node_matrix.temperatures[i] for i in node_matrix.table_indices))
     elif node_matrix.table_idx is not None:
-        temp_table_log.append(node_matrix.temperatures[node_matrix.table_idx])
+        table_temp = float(node_matrix.temperatures[node_matrix.table_idx])
     else:
-        temp_table_log.append(AMBIENT_TEMP)
+        table_temp = float(AMBIENT_TEMP)
+    
+    temp_table_log.append(table_temp)
+    
+    # Return summary for state manager
+    return {
+        'bp': bp_temp,
+        'table': table_temp,
+        'layers': layer_temps
+    }
 
 # =============================================================================
 # EVALUATION & PLOT
@@ -1725,27 +1812,33 @@ def main():
     
     # Plot 1: Temperature profile
     plt.subplot(2, 1, 1)
-    # Plot all layers with color gradient
-    max_layers = max(len(layers) for layers in layers_data)
-    colors = plt.cm.Reds(np.linspace(0.3, 1, max_layers))
     
-    # Plot each layer's temperature evolution
-    for layer_idx in range(max_layers):
-        layer_temps_over_time = [layers[layer_idx] if layer_idx < len(layers) else np.nan 
-                                  for layers in layers_data]
-        # Only label every 5th layer to avoid clutter
-        label = f'Layer {layer_idx+1}' if (layer_idx % 5 == 0 or layer_idx == max_layers-1) else None
-        plt.plot(t_data, layer_temps_over_time, color=colors[layer_idx], 
-                alpha=0.6, linewidth=0.8, label=label)
-    
-    plt.plot(t_data, bp_data, label='Base plate', color='blue', linewidth=2)
-    plt.plot(t_data, table_data, label='Welding table (Max)', color='grey', linewidth=2)
-    plt.axhline(y=INTERLAYER_TEMP, color='green', linestyle='--', linewidth=2, label='Interpass Temp')
-    plt.title('Temperature profile during the process (all layers tracked)')
-    plt.ylabel('Temperature [°C]')
-    plt.xlabel('Time [s]')
-    plt.legend(loc='best', fontsize=8)
-    plt.grid(True)
+    if not layers_data:
+        plt.text(0.5, 0.5, 'No simulation data to plot', 
+                horizontalalignment='center', verticalalignment='center')
+        plt.title('Temperature profile (No Data)')
+    else:
+        # Plot all layers with color gradient
+        max_layers = max(len(layers) for layers in layers_data)
+        colors = plt.cm.Reds(np.linspace(0.3, 1, max_layers))
+        
+        # Plot each layer's temperature evolution
+        for layer_idx in range(max_layers):
+            layer_temps_over_time = [layers[layer_idx] if layer_idx < len(layers) else np.nan 
+                                      for layers in layers_data]
+            # Only label every 5th layer to avoid clutter
+            label = f'Layer {layer_idx+1}' if (layer_idx % 5 == 0 or layer_idx == max_layers-1) else None
+            plt.plot(t_data, layer_temps_over_time, color=colors[layer_idx], 
+                    alpha=0.6, linewidth=0.8, label=label)
+        
+        plt.plot(t_data, bp_data, label='Base plate', color='blue', linewidth=2)
+        plt.plot(t_data, table_data, label='Welding table (Max)', color='grey', linewidth=2)
+        plt.axhline(y=INTERLAYER_TEMP, color='green', linestyle='--', linewidth=2, label='Interpass Temp')
+        plt.title('Temperature profile during the process (all layers tracked)')
+        plt.ylabel('Temperature [°C]')
+        plt.xlabel('Time [s]')
+        plt.legend(loc='best', fontsize=8)
+        plt.grid(True)
     
     # Plot 2: Wait times & Fit
     plt.subplot(2, 1, 2)

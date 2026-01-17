@@ -1,372 +1,441 @@
 """
 Simulation State Manager for WAAM Thermal Simulation
 
-This module provides functionality to save and resume thermal simulations,
-enabling restart capability if the simulation is interrupted.
+This module provides functionality to save and resume thermal simulations using HDF5.
+It handles continuous logging of simulation data (temperatures, active nodes) and 
+manages the resume capability by rolling back to the last successfully completed layer.
 
 Features:
-- Save simulation state periodically to file
-- Resume simulation from saved state
-- Validate parameter consistency (with exception for NUMBER_OF_LAYERS)
+- Continuous logging to HDF5 (append mode)
+- Efficient storage of temperature matrices and active masks
+- Resume capability:
+  - Detects last COMPLETED layer
+  - Removes partial data from interrupted layers
+  - Restores full simulation state (NodeMatrix) from file
+- Parameter validation to ensure consistency
 """
 
+import os
+import h5py
 import numpy as np
-import pickle
 import json
 from pathlib import Path
 
+# =============================================================================
+# PARAMETER EXTRACTION & UTILS
+# =============================================================================
 
-class SimulationState:
-    """Container for simulation state that can be saved/loaded."""
-    
-    def __init__(self):
-        # Simulation parameters (for validation)
-        self.parameters = {}
-        
-        # Current simulation state
-        self.current_time = 0.0
-        self.current_layer = 0
-        self.logging_counter = 0
-        
-        # Node matrix state
-        self.temperatures = None
-        self.active_mask = None
-        self.layer_idx = None
-        self.bead_idx = None
-        self.element_idx = None
-        self.level_type = None
-        self.masses = None
-        self.areas = None
-        self.radiation_areas = None
-        
-        # Active WAAM indices
-        self.active_waam_indices = None
-        self.bp_covered_area = 0.0
-        
-        # Table state
-        self.table_indices = []
-        self.table_idx = None
-        self.table_bp_contact_idx = None
-        self.table_grid = None
-        self.table_node_dims = None
-        self.table_subdivisions = None
-        
-        # Logged data
-        self.time_log = []
-        self.temp_layers_log = []
-        self.temp_bp_log = []
-        self.temp_table_log = []
-        self.wait_times = []
-
-
-def extract_parameters_from_globals():
+def extract_parameters_from_globals(ts_globals):
     """
-    Extract all relevant simulation parameters from the global scope.
-    These will be saved with the state for validation on resume.
+    Extract relevant simulation parameters from the Thermal_Sim globals.
+    Use this to capture the configuration for validation.
     """
-    import Thermal_Sim as ts
-    
-    params = {
+    # Define the keys we care about
+    keys = [
         # Simulation settings
-        'DT': ts.DT,
-        'LOGGING_FREQUENCY': ts.LOGGING_FREQUENCY,
-        'LOGGING_EVERY_N_STEPS': ts.LOGGING_EVERY_N_STEPS,
+        'DT', 'LOGGING_FREQUENCY', 'LOGGING_EVERY_N_STEPS',
         
         # Discretization
-        'N_LAYERS_AS_BEADS': ts.N_LAYERS_AS_BEADS,
-        'N_LAYERS_WITH_ELEMENTS': ts.N_LAYERS_WITH_ELEMENTS,
-        'N_ELEMENTS_PER_BEAD': ts.N_ELEMENTS_PER_BEAD,
+        'N_LAYERS_AS_BEADS', 'N_LAYERS_WITH_ELEMENTS', 'N_ELEMENTS_PER_BEAD',
         
         # WAAM process parameters
-        'NUMBER_OF_LAYERS': ts.NUMBER_OF_LAYERS,
-        'LAYER_HEIGHT': ts.LAYER_HEIGHT,
-        'TRACK_WIDTH': ts.TRACK_WIDTH,
-        'TRACK_OVERLAP': ts.TRACK_OVERLAP,
-        'NUMBER_OF_TRACKS': ts.NUMBER_OF_TRACKS,
-        'TRACK_LENGTH': ts.TRACK_LENGTH,
-        'PROCESS_SPEED': ts.PROCESS_SPEED,
-        'MELTING_TEMP': ts.MELTING_TEMP,
-        'INTERLAYER_TEMP': ts.INTERLAYER_TEMP,
-        'ARC_POWER': ts.ARC_POWER,
-        'ARC_POWER_CURRENT_FRACTION': ts.ARC_POWER_CURRENT_FRACTION,
-        'WIRE_FEED_RATE': ts.WIRE_FEED_RATE,
-        'WIRE_DIAMETER': ts.WIRE_DIAMETER,
+        'NUMBER_OF_LAYERS', 'LAYER_HEIGHT', 'TRACK_WIDTH', 'TRACK_OVERLAP', 
+        'NUMBER_OF_TRACKS', 'TRACK_LENGTH', 'PROCESS_SPEED', 'MELTING_TEMP', 
+        'INTERLAYER_TEMP', 'ARC_POWER', 'ARC_POWER_CURRENT_FRACTION', 
+        'WIRE_FEED_RATE', 'WIRE_DIAMETER',
         
         # Materials
-        'MATERIAL_WAAM_NAME': ts.MATERIAL_WAAM_NAME,
-        'RHO_WAAM': ts.RHO_WAAM,
-        'LAMBDA_WAAM': ts.LAMBDA_WAAM,
-        'EPSILON_WAAM': ts.EPSILON_WAAM,
-        'EPSILON_WAAM_LIQUID': ts.EPSILON_WAAM_LIQUID,
+        'MATERIAL_WAAM_NAME', 'RHO_WAAM', 'LAMBDA_WAAM', 'EPSILON_WAAM', 'EPSILON_WAAM_LIQUID',
         
         # Base plate
-        'BP_LENGTH': ts.BP_LENGTH,
-        'BP_WIDTH': ts.BP_WIDTH,
-        'BP_THICKNESS': ts.BP_THICKNESS,
-        'MATERIAL_BP_NAME': ts.MATERIAL_BP_NAME,
-        'RHO_BP': ts.RHO_BP,
-        'LAMBDA_BP': ts.LAMBDA_BP,
-        'EPSILON_BP': ts.EPSILON_BP,
+        'BP_LENGTH', 'BP_WIDTH', 'BP_THICKNESS', 'MATERIAL_BP_NAME', 
+        'RHO_BP', 'LAMBDA_BP', 'EPSILON_BP',
         
         # Table
-        'TABLE_LENGTH': ts.TABLE_LENGTH,
-        'TABLE_WIDTH': ts.TABLE_WIDTH,
-        'TABLE_THICKNESS': ts.TABLE_THICKNESS,
-        'MATERIAL_TABLE_NAME': ts.MATERIAL_TABLE_NAME,
-        'RHO_TABLE': ts.RHO_TABLE,
-        'LAMBDA_TABLE': ts.LAMBDA_TABLE,
-        'EPSILON_TABLE': ts.EPSILON_TABLE,
-        'TABLE_DISCRETIZATION_MODE': ts.TABLE_DISCRETIZATION_MODE,
-        'N_TABLE_X': ts.N_TABLE_X,
-        'N_TABLE_Y': ts.N_TABLE_Y,
-        'N_TABLE_Z': ts.N_TABLE_Z,
+        'TABLE_LENGTH', 'TABLE_WIDTH', 'TABLE_THICKNESS', 'MATERIAL_TABLE_NAME', 
+        'RHO_TABLE', 'LAMBDA_TABLE', 'EPSILON_TABLE', 
+        'TABLE_DISCRETIZATION_MODE', 'N_TABLE_X', 'N_TABLE_Y', 'N_TABLE_Z',
         
         # Environment
-        'AMBIENT_TEMP': ts.AMBIENT_TEMP,
-        'CONTACT_BP_TABLE': ts.CONTACT_BP_TABLE,
-        'ALPHA_CONTACT': ts.ALPHA_CONTACT,
-        'STEFAN_BOLTZMANN': ts.STEFAN_BOLTZMANN,
-    }
+        'AMBIENT_TEMP', 'CONTACT_BP_TABLE', 'ALPHA_CONTACT', 'STEFAN_BOLTZMANN',
+    ]
     
+    params = {}
+    for key in keys:
+        if hasattr(ts_globals, key):
+            params[key] = getattr(ts_globals, key)
+        elif key in ts_globals: # Handle dict if passed instead of module
+             params[key] = ts_globals[key]
+            
     return params
-
-
-def save_simulation_state(state, filename):
-    """
-    Save simulation state to file using pickle serialization.
-    
-    SECURITY NOTE: This function uses pickle for serialization. Only load state files
-    from trusted sources, as pickle can execute arbitrary code when loading. Never load
-    state files from untrusted or unknown sources.
-    
-    Args:
-        state: SimulationState object
-        filename: Path to save file
-    """
-    filepath = Path(filename)
-    
-    # Create backup if file exists
-    if filepath.exists():
-        backup_path = filepath.with_suffix('.backup')
-        if backup_path.exists():
-            backup_path.unlink()
-        filepath.rename(backup_path)
-    
-    # Save state using pickle for binary efficiency
-    with open(filepath, 'wb') as f:
-        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-    
-    print(f"Simulation state saved to {filename}")
-
-
-def load_simulation_state(filename):
-    """
-    Load simulation state from file.
-    
-    Args:
-        filename: Path to state file
-        
-    Returns:
-        SimulationState object or None if file doesn't exist
-    """
-    filepath = Path(filename)
-    
-    if not filepath.exists():
-        return None
-    
-    try:
-        with open(filepath, 'rb') as f:
-            state = pickle.load(f)
-        print(f"Simulation state loaded from {filename}")
-        return state
-    except Exception as e:
-        print(f"Error loading state from {filename}: {e}")
-        return None
 
 
 def compare_parameters(saved_params, current_params, ignore_keys=None):
     """
-    Compare saved and current parameters to check if they match.
-    
-    Args:
-        saved_params: Dictionary of saved parameters
-        current_params: Dictionary of current parameters
-        ignore_keys: List of parameter keys to ignore in comparison
-        
-    Returns:
-        tuple: (match, differences)
-            match: Boolean indicating if parameters match
-            differences: Dictionary of differing parameters
-                - Key: parameter name
-                - Value: tuple of (saved_value, current_value)
-                - Special case: ('missing', saved_value, None) if key not in current_params
+    Compare saved and current parameters.
+    Returns (match_boolean, diff_dict)
     """
     if ignore_keys is None:
         ignore_keys = []
     
     differences = {}
-    
-    for key in saved_params:
+    for key, saved_val in saved_params.items():
         if key in ignore_keys:
             continue
             
         if key not in current_params:
-            # Special tuple format for missing parameters
-            differences[key] = ('missing', saved_params[key], None)
+            differences[key] = (saved_val, 'MISSING')
             continue
+            
+        curr_val = current_params[key]
         
-        saved_val = saved_params[key]
-        current_val = current_params[key]
+        # Numeric comparison with tolerance
+        if isinstance(saved_val, (int, float)) and isinstance(curr_val, (int, float)):
+            if not np.isclose(saved_val, curr_val, rtol=1e-5):
+                differences[key] = (saved_val, curr_val)
+        elif saved_val != curr_val:
+            differences[key] = (saved_val, curr_val)
+            
+    return len(differences) == 0, differences
+
+
+# =============================================================================
+# HDF5 STATE MANAGER
+# =============================================================================
+
+class SimulationStateManager:
+    def __init__(self, filename, current_params, total_nodes):
+        self.filename = Path(filename)
+        self.current_params = current_params
+        self.total_nodes = total_nodes
+        self.file = None
+
+        # Dataset Names
+        self.DS_TIME = 'time'
+        self.DS_LAYER_IDX = 'layer_indices'
+        self.DS_TEMPS = 'temperatures'
+        self.DS_ACTIVE = 'active_mask'
+        self.DS_LEVEL_TYPE = 'level_type'
+        self.DS_RAD_AREAS = 'radiation_areas'
         
-        # Compare with tolerance for floating point values
-        if isinstance(saved_val, (int, float)) and isinstance(current_val, (int, float)):
-            if not np.isclose(saved_val, current_val, rtol=1e-9):
-                differences[key] = (saved_val, current_val)
+        # Node Mapping Datasets (Static/Topology)
+        self.DS_NODE_MAP_LAYER = 'node_map_layer'
+        self.DS_NODE_MAP_BEAD = 'node_map_bead'
+        self.DS_NODE_MAP_ELEM = 'node_map_element'
+
+        self.DS_MASSES = 'masses' # Static usually, but good to check or save once
+        self.DS_AREAS = 'areas'   # Static
+        
+        # Summary Datasets (for plotting)
+        self.DS_SUMMARY_TIME = 'summary_time'
+        self.DS_SUMMARY_LAYERS = 'summary_layers'
+        self.DS_SUMMARY_BP = 'summary_bp'
+        self.DS_SUMMARY_TABLE = 'summary_table'
+        
+        # Attribute Names
+        self.ATTR_PARAMS = 'parameters'
+        self.ATTR_LAST_COMPLETED_LAYER = 'last_completed_layer'
+        self.ATTR_WAIT_TIMES = 'wait_times'
+
+    def initialize_or_load(self):
+        """
+        Setup the HDF5 file.
+        If exists: Checks params, prunes unfinished layers, returns resume state.
+        If new: Creates datasets.
+        
+        Returns:
+            start_layer_idx (int): The layer index to start/resume from.
+            resume_state (dict or None): Dictionary to restore NodeMatrix if resuming.
+        """
+        if self.filename.exists():
+            return self._handle_existing_file()
         else:
-            if saved_val != current_val:
-                differences[key] = (saved_val, current_val)
-    
-    match = len(differences) == 0
-    return match, differences
+            self._create_new_file()
+            return 0, None
 
-
-def check_state_file_compatibility(filename):
-    """
-    Check if saved state file is compatible with current parameters.
-    
-    Args:
-        filename: Path to state file
+    def _create_new_file(self):
+        """Create new HDF5 file with unlimited time dimension."""
+        print(f"Creating new state file: {self.filename}")
+        self.file = h5py.File(self.filename, 'w')
         
-    Returns:
-        tuple: (compatible, state, differences)
-            compatible: Boolean indicating compatibility
-            state: Loaded SimulationState object or None
-            differences: Dictionary of parameter differences
-    """
-    state = load_simulation_state(filename)
-    
-    if state is None:
-        return False, None, {}
-    
-    current_params = extract_parameters_from_globals()
-    
-    # NUMBER_OF_LAYERS can be changed (to extend or shorten simulation)
-    ignore_keys = ['NUMBER_OF_LAYERS']
-    
-    match, differences = compare_parameters(state.parameters, current_params, ignore_keys)
-    
-    if not match:
-        print("\nParameter mismatch detected:")
-        for key, (saved_val, current_val) in differences.items():
-            print(f"  {key}: saved={saved_val}, current={current_val}")
-    
-    return match, state, differences
-
-
-def create_state_from_node_matrix(node_matrix, current_time, current_layer, 
-                                   logging_counter, time_log, temp_layers_log, 
-                                   temp_bp_log, temp_table_log, wait_times):
-    """
-    Create a SimulationState object from current simulation data.
-    
-    Args:
-        node_matrix: NodeMatrix object
-        current_time: Current simulation time [s]
-        current_layer: Current layer index
-        logging_counter: Current logging counter
-        time_log: List of logged times [s]
-        temp_layers_log: List of logged layer temperatures [°C]
-        temp_bp_log: List of logged base plate temperatures [°C]
-        temp_table_log: List of logged table temperatures [°C]
-        wait_times: List of wait times per layer [s]
+        # Save parameters
+        # Convert dict to JSON string for attribute storage (simpler than types)
+        # Handle numpy types in params if any
+        serializable_params = {k: float(v) if isinstance(v, (np.float64, np.float32)) else v 
+                               for k,v in self.current_params.items()}
+        self.file.attrs[self.ATTR_PARAMS] = json.dumps(serializable_params)
+        self.file.attrs[self.ATTR_LAST_COMPLETED_LAYER] = -1 # None completed
+        self.file.attrs[self.ATTR_WAIT_TIMES] = json.dumps([])
         
-    Returns:
-        SimulationState object
-    """
-    state = SimulationState()
-    
-    # Save parameters for validation
-    state.parameters = extract_parameters_from_globals()
-    
-    # Save current simulation progress
-    state.current_time = current_time
-    state.current_layer = current_layer
-    state.logging_counter = logging_counter
-    
-    # Save node matrix state (deep copy arrays)
-    state.temperatures = node_matrix.temperatures.copy()
-    state.active_mask = node_matrix.active_mask.copy()
-    state.layer_idx = node_matrix.layer_idx.copy()
-    state.bead_idx = node_matrix.bead_idx.copy()
-    state.element_idx = node_matrix.element_idx.copy()
-    state.level_type = node_matrix.level_type.copy()
-    state.masses = node_matrix.masses.copy()
-    state.areas = node_matrix.areas.copy()
-    state.radiation_areas = node_matrix.radiation_areas.copy()
-    
-    # Save active WAAM indices
-    state.active_waam_indices = node_matrix.active_waam_indices.copy()
-    state.bp_covered_area = node_matrix.bp_covered_area
-    
-    # Save table state
-    state.table_indices = node_matrix.table_indices.copy()
-    state.table_idx = node_matrix.table_idx
-    state.table_bp_contact_idx = node_matrix.table_bp_contact_idx
-    if node_matrix.table_grid is not None:
-        state.table_grid = node_matrix.table_grid.copy()
-    state.table_node_dims = node_matrix.table_node_dims
-    state.table_subdivisions = node_matrix.table_subdivisions
-    
-    # Save logged data
-    state.time_log = list(time_log)
-    state.temp_layers_log = [list(layer_temps) for layer_temps in temp_layers_log]
-    state.temp_bp_log = list(temp_bp_log)
-    state.temp_table_log = list(temp_table_log)
-    state.wait_times = list(wait_times)
-    
-    return state
+        # Create Datasets
+        # Shape: (Time, Nodes)
+        # MaxShape: (Unlimited, Unlimited) to allow extending time AND nodes (if extending sim)
+        chunk_size_time = 100
+        
+        self.file.create_dataset(self.DS_TIME, shape=(0,), maxshape=(None,), 
+                                 dtype='f8', chunks=(chunk_size_time,))
+        
+        self.file.create_dataset(self.DS_LAYER_IDX, shape=(0,), maxshape=(None,), 
+                                 dtype='i4', chunks=(chunk_size_time,))
+        
+        self.file.create_dataset(self.DS_TEMPS, shape=(0, self.total_nodes), maxshape=(None, None),
+                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+        
+        self.file.create_dataset(self.DS_ACTIVE, shape=(0, self.total_nodes), maxshape=(None, None),
+                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes), compression="gzip") # Store as int8
+        
+        self.file.create_dataset(self.DS_LEVEL_TYPE, shape=(0, self.total_nodes), maxshape=(None, None),
+                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+        
+        self.file.create_dataset(self.DS_RAD_AREAS, shape=(0, self.total_nodes), maxshape=(None, None),
+                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+        
+        # Static Node Mapping (Topological indices)
+        self.file.create_dataset(self.DS_NODE_MAP_LAYER, shape=(self.total_nodes,), dtype='i4')
+        self.file.create_dataset(self.DS_NODE_MAP_BEAD, shape=(self.total_nodes,), dtype='i4')
+        self.file.create_dataset(self.DS_NODE_MAP_ELEM, shape=(self.total_nodes,), dtype='i4')
+        
+        # Summary Datasets (Plotting)
+        num_layers = self.current_params.get('NUMBER_OF_LAYERS', 1)
+        self.file.create_dataset(self.DS_SUMMARY_TIME, shape=(0,), maxshape=(None,), dtype='f8', chunks=(chunk_size_time,))
+        self.file.create_dataset(self.DS_SUMMARY_BP, shape=(0,), maxshape=(None,), dtype='f4', chunks=(chunk_size_time,))
+        self.file.create_dataset(self.DS_SUMMARY_TABLE, shape=(0,), maxshape=(None,), dtype='f4', chunks=(chunk_size_time,))
+        self.file.create_dataset(self.DS_SUMMARY_LAYERS, shape=(0, num_layers), maxshape=(None, num_layers), 
+                                 dtype='f4', chunks=(chunk_size_time, num_layers))
+        
+        self.file.flush()
 
+    def _handle_existing_file(self):
+        """Check existing file, prune partials, extract state."""
+        print(f"Checking existing state file: {self.filename}")
+        self.file = h5py.File(self.filename, 'r+') # Read/Write
+        
+        # 1. Parameter Check
+        try:
+            saved_params = json.loads(self.file.attrs[self.ATTR_PARAMS])
+        except Exception as e:
+            self.file.close()
+            raise ValueError(f"Parameters missing or corrupt in '{self.filename}': {e}. "
+                             f"Delete the file to start a new simulation.")
+            
+        # Allow NUMBER_OF_LAYERS to change
+        match, diff = compare_parameters(saved_params, self.current_params, ignore_keys=['NUMBER_OF_LAYERS'])
+        if not match:
+            print("❌ Parameters differ from saved state:")
+            for k, v in diff.items():
+                print(f"   {k}: Saved={v[0]}, Current={v[1]}")
+            self.file.close()
+            raise ValueError(f"Simulation parameters do not match the existing file '{self.filename}'. "
+                             f"To start a new simulation, delete or rename the file.")
+        
+        # 2. Pruning Logic
+        # Strategy: "Wiedereinstieg nur zum Start eines Layers"
+        # We rely on 'last_completed_layer' attribute.
+        last_completed = self.file.attrs.get(self.ATTR_LAST_COMPLETED_LAYER, -1)
+        
+        print(f"✓ Parameters match. Last completed layer in file: {last_completed}")
+        
+        # If simulation was complete (last_completed == NUM_LAYERS -1) AND we extended layers, we resume.
+        # Logic holds: last_completed is safe.
+        
+        if last_completed == -1:
+            print("No completed layers found. Restarting from Layer 0.")
+            self._truncate_datasets(0)
+            return 0, None
+            
+        # Find the index in datasets corresponding to the LAST step of last_completed_layer
+        layer_indices = self.file[self.DS_LAYER_IDX][:]
+        
+        # We want to keep steps where layer_index <= last_completed
+        valid_indices = np.where(layer_indices <= last_completed)[0]
+        
+        if len(valid_indices) == 0:
+             # Should not happen if last_completed > -1 but safety first
+             self._truncate_datasets(0)
+             return 0, None
+             
+        cut_point = valid_indices[-1] + 1
+        
+        # Truncate if there are extra steps (partial next layer)
+        if cut_point < len(layer_indices):
+            print(f"Pruning unfinished layer data (Steps {cut_point} to {len(layer_indices)})...")
+            self._truncate_datasets(cut_point)
+            
+        # 3. Extract Resume State
+        # Get the VERY LAST valid frame
+        # Make sure to handle array dimensions if they differ from self.total_nodes
+        saved_nodes = self.file[self.DS_TEMPS].shape[1]
+        
+        # Read the slice
+        temps = self.file[self.DS_TEMPS][cut_point-1]
+        active = self.file[self.DS_ACTIVE][cut_point-1]
+        level_type = self.file[self.DS_LEVEL_TYPE][cut_point-1]
+        rad_areas = self.file[self.DS_RAD_AREAS][cut_point-1]
+        time = self.file[self.DS_TIME][cut_point-1]
+        
+        resume_state = {
+            'temperatures': temps,
+            'active_mask': active.astype(bool),
+            'level_type': level_type.astype('i1'),
+            'radiation_areas': rad_areas,
+            'time': time,
+            'layer_idx': last_completed + 1
+        }
 
-def restore_node_matrix_from_state(state, node_matrix):
-    """
-    Restore NodeMatrix object from saved state.
-    Handles cases where the node_matrix size may differ (e.g., when extending simulation).
-    
-    When extending a simulation (increasing NUMBER_OF_LAYERS), the new node_matrix
-    will be larger than the saved state. This function copies the saved data into
-    the first portion of the arrays. New nodes beyond copy_size remain at their
-    initialized values (typically AMBIENT_TEMP for temperatures, False for active_mask).
-    
-    Args:
-        state: SimulationState object
-        node_matrix: NodeMatrix object to restore into
-    """
-    # Determine the size to copy (minimum of saved and current)
-    saved_size = len(state.temperatures)
-    current_size = len(node_matrix.temperatures)
-    copy_size = min(saved_size, current_size)
-    
-    # Restore arrays (only up to the saved size)
-    # New nodes beyond copy_size keep their initialization values
-    node_matrix.temperatures[:copy_size] = state.temperatures[:copy_size]
-    node_matrix.active_mask[:copy_size] = state.active_mask[:copy_size]
-    node_matrix.layer_idx[:copy_size] = state.layer_idx[:copy_size]
-    node_matrix.bead_idx[:copy_size] = state.bead_idx[:copy_size]
-    node_matrix.element_idx[:copy_size] = state.element_idx[:copy_size]
-    node_matrix.level_type[:copy_size] = state.level_type[:copy_size]
-    node_matrix.masses[:copy_size] = state.masses[:copy_size]
-    node_matrix.areas[:copy_size] = state.areas[:copy_size]
-    node_matrix.radiation_areas[:copy_size] = state.radiation_areas[:copy_size]
-    
-    # Restore active indices
-    node_matrix.active_waam_indices = state.active_waam_indices.copy()
-    node_matrix.bp_covered_area = state.bp_covered_area
-    
-    # Restore table state
-    node_matrix.table_indices = state.table_indices.copy()
-    node_matrix.table_idx = state.table_idx
-    node_matrix.table_bp_contact_idx = state.table_bp_contact_idx
-    if state.table_grid is not None:
-        node_matrix.table_grid = state.table_grid.copy()
-    node_matrix.table_node_dims = state.table_node_dims
-    node_matrix.table_subdivisions = state.table_subdivisions
+        # Load summary logs
+        if self.DS_SUMMARY_TIME in self.file:
+            # We must only load up to cut_point
+            sm_time = self.file[self.DS_SUMMARY_TIME][:cut_point]
+            sm_bp = self.file[self.DS_SUMMARY_BP][:cut_point]
+            sm_table = self.file[self.DS_SUMMARY_TABLE][:cut_point]
+            sm_layers_raw = self.file[self.DS_SUMMARY_LAYERS][:cut_point]
+            
+            # Reconstruct list of lists for layers
+            # sm_layers_raw is [Time x MaxLayers]
+            # Since NUMBER_OF_LAYERS is constant, we can just slice based on top layer?
+            # Actually Thermal_Sim expects [ [L1], [L1, L2], ... ]
+            # We can just filter out -1 or NaN (assuming we used a fill value).
+            # Default HDF5 fill is 0. But 0 is valid temp. Let's assume -1 for inactive.
+            
+            reconstructed_layers = []
+            layer_ids_in_file = self.file[self.DS_LAYER_IDX][:cut_point]
+            for step_idx in range(cut_point):
+                curr_top = layer_ids_in_file[step_idx]
+                reconstructed_layers.append(list(sm_layers_raw[step_idx, :curr_top+1]))
+            
+            resume_state['history'] = {
+                'time': list(sm_time),
+                'bp': list(sm_bp),
+                'table': list(sm_table),
+                'layers': reconstructed_layers
+            }
+        
+        # Extract wait times
+        try:
+            wait_times = json.loads(self.file.attrs.get(self.ATTR_WAIT_TIMES, '[]'))
+            # Prune wait times if they exceed the completed layers
+            # last_completed is 0-based index. If last_completed=0 (Layer 0 done), we have 1 wait time? 
+            # Wait time is calculated AFTER layer is done. So we should have len(wait_times) == last_completed + 1
+            if len(wait_times) > last_completed + 1:
+                wait_times = wait_times[:last_completed + 1]
+            resume_state['wait_times'] = wait_times
+        except:
+            resume_state['wait_times'] = []
+
+        # 4. Handle Node Count Mismatch (Extension)
+        if self.total_nodes > saved_nodes:
+             print(f"Extending simulation nodes: {saved_nodes} -> {self.total_nodes}")
+             
+             # Resize HDF5 datasets columns
+             for name in [self.DS_TEMPS, self.DS_ACTIVE, self.DS_RAD_AREAS]:
+                 dset = self.file[name]
+                 dset.resize((dset.shape[0], self.total_nodes))
+                 
+             # Pad the resume_state vectors with defaults
+             pad_width = self.total_nodes - saved_nodes
+             ambient = self.current_params.get('AMBIENT_TEMP', 25.0)
+             resume_state['temperatures'] = np.pad(resume_state['temperatures'], (0, pad_width), constant_values=ambient)
+             resume_state['active_mask'] = np.pad(resume_state['active_mask'], (0, pad_width), constant_values=False)
+             resume_state['radiation_areas'] = np.pad(resume_state['radiation_areas'], (0, pad_width), constant_values=0.0)
+             
+        elif self.total_nodes < saved_nodes:
+             print("Warning: Current node count is SMALLER than saved state. truncating nodes.")
+             resume_state['temperatures'] = resume_state['temperatures'][:self.total_nodes]
+             resume_state['active_mask'] = resume_state['active_mask'][:self.total_nodes]
+             resume_state['radiation_areas'] = resume_state['radiation_areas'][:self.total_nodes]
+             
+             # Resize HDF5 datasets columns to shrink
+             for name in [self.DS_TEMPS, self.DS_ACTIVE, self.DS_RAD_AREAS]:
+                 dset = self.file[name]
+                 dset.resize((dset.shape[0], self.total_nodes))
+
+        next_layer = int(last_completed + 1)
+        print(f"Resuming simulation at start of Layer {next_layer}")
+        return next_layer, resume_state
+
+    def _truncate_datasets(self, size):
+        """Truncate all time-dependent datasets to 'size'."""
+        names = [self.DS_TIME, self.DS_LAYER_IDX, self.DS_TEMPS, self.DS_ACTIVE, self.DS_RAD_AREAS,
+                 self.DS_SUMMARY_TIME, self.DS_SUMMARY_BP, self.DS_SUMMARY_TABLE, self.DS_SUMMARY_LAYERS]
+        for name in names:
+             if name in self.file:
+                current_shape = list(self.file[name].shape)
+                current_shape[0] = size
+                self.file[name].resize(tuple(current_shape))
+        self.file.flush()
+
+    def log_step(self, time, layer_idx, node_matrix, summary_data=None):
+        """
+        Append a single timestep to the file.
+        summary_data: dict with 'bp', 'table', 'layers' (list of maxes)
+        """
+        if self.file is None:
+            return
+
+        # Current index
+        idx = self.file[self.DS_TIME].shape[0]
+        new_size = idx + 1
+        
+        # Resize dimensions (Time axis)
+        self.file[self.DS_TIME].resize((new_size,))
+        self.file[self.DS_LAYER_IDX].resize((new_size,))
+        self.file[self.DS_TEMPS].resize((new_size, self.total_nodes))
+        self.file[self.DS_ACTIVE].resize((new_size, self.total_nodes))
+        self.file[self.DS_LEVEL_TYPE].resize((new_size, self.total_nodes))
+        self.file[self.DS_RAD_AREAS].resize((new_size, self.total_nodes))
+        
+        # Write data
+        self.file[self.DS_TIME][idx] = time
+        self.file[self.DS_LAYER_IDX][idx] = layer_idx
+        self.file[self.DS_TEMPS][idx, :] = node_matrix.temperatures[:self.total_nodes]
+        self.file[self.DS_ACTIVE][idx, :] = node_matrix.active_mask[:self.total_nodes].astype('i1')
+        self.file[self.DS_LEVEL_TYPE][idx, :] = node_matrix.level_type[:self.total_nodes].astype('i1')
+        self.file[self.DS_RAD_AREAS][idx, :] = node_matrix.radiation_areas[:self.total_nodes]
+
+        # Update Node Mapping (Static properties, but populated dynamically)
+        self.file[self.DS_NODE_MAP_LAYER][:] = node_matrix.layer_idx[:self.total_nodes]
+        self.file[self.DS_NODE_MAP_BEAD][:] = node_matrix.bead_idx[:self.total_nodes]
+        self.file[self.DS_NODE_MAP_ELEM][:] = node_matrix.element_idx[:self.total_nodes]
+
+        # Log Summary
+        if summary_data and self.DS_SUMMARY_TIME in self.file:
+            self.file[self.DS_SUMMARY_TIME].resize((new_size,))
+            self.file[self.DS_SUMMARY_BP].resize((new_size,))
+            self.file[self.DS_SUMMARY_TABLE].resize((new_size,))
+            self.file[self.DS_SUMMARY_LAYERS].resize((new_size, self.file[self.DS_SUMMARY_LAYERS].shape[1]))
+            
+            self.file[self.DS_SUMMARY_TIME][idx] = time
+            self.file[self.DS_SUMMARY_BP][idx] = summary_data['bp']
+            self.file[self.DS_SUMMARY_TABLE][idx] = summary_data['table']
+            
+            # Pad layers_maxes to fixed width
+            num_recorded = len(summary_data['layers'])
+            total_slots = self.file[self.DS_SUMMARY_LAYERS].shape[1]
+            padded_layers = np.full(total_slots, -1.0, dtype='f4')
+            padded_layers[:num_recorded] = summary_data['layers']
+            self.file[self.DS_SUMMARY_LAYERS][idx, :] = padded_layers
+
+    def mark_layer_complete(self, layer_idx, wait_time=None):
+        """Update the last completed layer attribute and log wait time."""
+        if self.file:
+            self.file.attrs[self.ATTR_LAST_COMPLETED_LAYER] = layer_idx
+            
+            if wait_time is not None:
+                try:
+                    current_waits = json.loads(self.file.attrs.get(self.ATTR_WAIT_TIMES, '[]'))
+                    current_waits.append(wait_time)
+                    self.file.attrs[self.ATTR_WAIT_TIMES] = json.dumps(current_waits)
+                except Exception as e:
+                    print(f"Error saving wait time: {e}")
+                    
+            self.file.flush()
+            
+
+    def close(self):
+        if self.file:
+            self.file.close()
+
+# Helper for compatibility with legacy code calling
+def create_state_manager(filename, params, total_nodes):
+    return SimulationStateManager(filename, params, total_nodes)
+
