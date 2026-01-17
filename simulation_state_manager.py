@@ -133,7 +133,11 @@ def extract_parameters_from_globals():
 
 def save_simulation_state(state, filename):
     """
-    Save simulation state to file.
+    Save simulation state to file using pickle serialization.
+    
+    SECURITY NOTE: This function uses pickle for serialization. Only load state files
+    from trusted sources, as pickle can execute arbitrary code when loading. Never load
+    state files from untrusted or unknown sources.
     
     Args:
         state: SimulationState object
@@ -193,6 +197,9 @@ def compare_parameters(saved_params, current_params, ignore_keys=None):
         tuple: (match, differences)
             match: Boolean indicating if parameters match
             differences: Dictionary of differing parameters
+                - Key: parameter name
+                - Value: tuple of (saved_value, current_value)
+                - Special case: ('missing', saved_value, None) if key not in current_params
     """
     if ignore_keys is None:
         ignore_keys = []
@@ -204,7 +211,8 @@ def compare_parameters(saved_params, current_params, ignore_keys=None):
             continue
             
         if key not in current_params:
-            differences[key] = ('missing_in_current', saved_params[key], None)
+            # Special tuple format for missing parameters
+            differences[key] = ('missing', saved_params[key], None)
             continue
         
         saved_val = saved_params[key]
@@ -263,14 +271,14 @@ def create_state_from_node_matrix(node_matrix, current_time, current_layer,
     
     Args:
         node_matrix: NodeMatrix object
-        current_time: Current simulation time
+        current_time: Current simulation time [s]
         current_layer: Current layer index
         logging_counter: Current logging counter
-        time_log: List of logged times
-        temp_layers_log: List of logged layer temperatures
-        temp_bp_log: List of logged base plate temperatures
-        temp_table_log: List of logged table temperatures
-        wait_times: List of wait times per layer
+        time_log: List of logged times [s]
+        temp_layers_log: List of logged layer temperatures [°C]
+        temp_bp_log: List of logged base plate temperatures [°C]
+        temp_table_log: List of logged table temperatures [°C]
+        wait_times: List of wait times per layer [s]
         
     Returns:
         SimulationState object
@@ -324,6 +332,11 @@ def restore_node_matrix_from_state(state, node_matrix):
     Restore NodeMatrix object from saved state.
     Handles cases where the node_matrix size may differ (e.g., when extending simulation).
     
+    When extending a simulation (increasing NUMBER_OF_LAYERS), the new node_matrix
+    will be larger than the saved state. This function copies the saved data into
+    the first portion of the arrays. New nodes beyond copy_size remain at their
+    initialized values (typically AMBIENT_TEMP for temperatures, False for active_mask).
+    
     Args:
         state: SimulationState object
         node_matrix: NodeMatrix object to restore into
@@ -334,6 +347,7 @@ def restore_node_matrix_from_state(state, node_matrix):
     copy_size = min(saved_size, current_size)
     
     # Restore arrays (only up to the saved size)
+    # New nodes beyond copy_size keep their initialization values
     node_matrix.temperatures[:copy_size] = state.temperatures[:copy_size]
     node_matrix.active_mask[:copy_size] = state.active_mask[:copy_size]
     node_matrix.layer_idx[:copy_size] = state.layer_idx[:copy_size]

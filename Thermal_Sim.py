@@ -19,7 +19,7 @@ from simulation_state_manager import (
 # --- Simulation Settings ---
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
 LOGGING_FREQUENCY = 1.0  # [s] How often to log data for plotting
-LOGGING_EVERY_N_STEPS = int(LOGGING_FREQUENCY / DT)  # Log data every N time steps to reduce memory usage and plotting overhead
+LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N time steps (minimum 1 to prevent division by zero)
 
 # --- Discretization Settings (counted from top) ---
 # NOTE: Element-level discretization increases computational cost significantly.
