@@ -12,7 +12,8 @@ from Material_Properties import get_material
 
 # --- Simulation Settings ---
 DT = 0.02   # Simulation time step [s] (Smaller = more accurate, but slower)
-LOGGING_EVERY_N_STEPS = 20  # Log data every N time steps to reduce memory usage and plotting overhead
+LOGGING_FREQUENCY = 1.0  # [s] How often to log data for plotting
+LOGGING_EVERY_N_STEPS = int(LOGGING_FREQUENCY / DT)  # Log data every N time steps to reduce memory usage and plotting overhead
 
 # --- Discretization Settings (counted from top) ---
 # NOTE: Element-level discretization increases computational cost significantly.
@@ -1261,6 +1262,7 @@ def run_simulation():
     # Rigorous 3D Stability criterion: dt <= 1 / (2 * alpha * (1/dx^2 + 1/dy^2 + 1/dz^2))
     inv_sq_sum = (1.0/d_x**2) + (1.0/d_y**2) + (1.0/d_z**2)
     dt_max_stable = 1.0 / (2.0 * alpha * inv_sq_sum)
+    dx_min = min(d_x, d_y, d_z)
     
     # Use local variable for simulation time step
     dt_sim = DT
