@@ -6,7 +6,7 @@ from scipy.optimize import curve_fit
 from scipy.integrate import quad
 from numba import jit
 from Material_Properties import get_material
-from async_state_manager import (
+from simulation_state_manager import (
     create_state_manager,
     extract_parameters_from_globals
 )
