@@ -24,5 +24,5 @@ debug.log
 Thumbs.db
 
 # Simulation outputs (optional - uncomment if you don't want to track these)
-# *.h5
-# node_temperatures.h5
+*.h5
+

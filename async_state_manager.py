@@ -59,6 +59,7 @@ class AsyncSimulationStateManager(SimulationStateManager):
         # Buffer management
         self.buffer_size = buffer_size
         self.buffer = deque(maxlen=buffer_size)
+        self.log_counter = 0
         
         # Statistics
         self.writes_completed = 0
@@ -199,12 +200,18 @@ class AsyncSimulationStateManager(SimulationStateManager):
                     padded_layers[:num_recorded] = summary_data['layers']
                     self.file[self.DS_SUMMARY_LAYERS][idx, :] = padded_layers
             
-            # Update node mapping (once per batch with last entry)
+            # Update node mapping (use the most recent valid map in the buffer)
             if buffer:
-                last_data = buffer[-1][3]  # node_matrix_data from last entry
-                self.file[self.DS_NODE_MAP_LAYER][:] = last_data['layer_idx']
-                self.file[self.DS_NODE_MAP_BEAD][:] = last_data['bead_idx']
-                self.file[self.DS_NODE_MAP_ELEM][:] = last_data['element_idx']
+                last_valid_static = None
+                for item in reversed(buffer):
+                    if item[3].get('layer_idx') is not None:
+                        last_valid_static = item[3]
+                        break
+                
+                if last_valid_static:
+                    self.file[self.DS_NODE_MAP_LAYER][:] = last_valid_static['layer_idx']
+                    self.file[self.DS_NODE_MAP_BEAD][:] = last_valid_static['bead_idx']
+                    self.file[self.DS_NODE_MAP_ELEM][:] = last_valid_static['element_idx']
             
             # Flush to disk
             self.file.flush()
@@ -230,16 +237,28 @@ class AsyncSimulationStateManager(SimulationStateManager):
         if self.file is None:
             return
         
+        self.log_counter += 1
+        # Only copy static mapping arrays periodically (every buffer_size steps)
+        # to save main thread CPU time.
+        include_static = (self.log_counter % self.buffer_size == 0) or (self.log_counter == 1)
+
         # Extract data from node_matrix (copy to avoid threading issues)
+        # Note: level_type is active int8, so .copy() is sufficient (no astype needed if already int8)
         node_matrix_data = {
             'temperatures': node_matrix.temperatures[:self.total_nodes].copy(),
             'active_mask': node_matrix.active_mask[:self.total_nodes].astype('i1'),
-            'level_type': node_matrix.level_type[:self.total_nodes].astype('i1'),
+            'level_type': node_matrix.level_type[:self.total_nodes].copy(), 
             'radiation_areas': node_matrix.radiation_areas[:self.total_nodes].copy(),
-            'layer_idx': node_matrix.layer_idx[:self.total_nodes].copy(),
-            'bead_idx': node_matrix.bead_idx[:self.total_nodes].copy(),
-            'element_idx': node_matrix.element_idx[:self.total_nodes].copy(),
         }
+        
+        if include_static:
+            node_matrix_data['layer_idx'] = node_matrix.layer_idx[:self.total_nodes].copy()
+            node_matrix_data['bead_idx'] = node_matrix.bead_idx[:self.total_nodes].copy()
+            node_matrix_data['element_idx'] = node_matrix.element_idx[:self.total_nodes].copy()
+        else:
+            node_matrix_data['layer_idx'] = None
+            node_matrix_data['bead_idx'] = None
+            node_matrix_data['element_idx'] = None
         
         # Queue the log entry
         try:

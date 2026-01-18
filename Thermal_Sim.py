@@ -27,9 +27,9 @@ LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N 
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
 # Element-level refinement is prepared but not yet fully implemented
-N_LAYERS_AS_BEADS = 2       # Number of top layers modeled as individual beads (default: 2)
-N_LAYERS_WITH_ELEMENTS = 0  # Number of top layers where beads are subdivided into elements (0 = disabled)
-N_ELEMENTS_PER_BEAD = 57     # Number of elements per bead along track length (if enabled)
+N_LAYERS_AS_BEADS = 4       # Number of top layers modeled as individual beads (default: 2)
+N_LAYERS_WITH_ELEMENTS = 2  # Number of top layers where beads are subdivided into elements (0 = disabled)
+N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
 NUMBER_OF_LAYERS = 15        # Total number of layers to be deposited (Reccomended to use +1 Layer for better results)

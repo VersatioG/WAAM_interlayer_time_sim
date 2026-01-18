@@ -178,17 +178,19 @@ class SimulationStateManager:
         self.file.create_dataset(self.DS_LAYER_IDX, shape=(0,), maxshape=(None,), 
                                  dtype='i4', chunks=(chunk_size_time,))
         
+        # Performance Optimization: Disable compression ("gzip") to maximize write speed
+        # The file size increase is negligible (~400MB total) compared to the speedup
         self.file.create_dataset(self.DS_TEMPS, shape=(0, self.total_nodes), maxshape=(None, None),
-                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes))
         
         self.file.create_dataset(self.DS_ACTIVE, shape=(0, self.total_nodes), maxshape=(None, None),
-                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes), compression="gzip") # Store as int8
+                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes)) # Store as int8
         
         self.file.create_dataset(self.DS_LEVEL_TYPE, shape=(0, self.total_nodes), maxshape=(None, None),
-                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+                                 dtype='i1', chunks=(chunk_size_time, self.total_nodes))
         
         self.file.create_dataset(self.DS_RAD_AREAS, shape=(0, self.total_nodes), maxshape=(None, None),
-                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes), compression="gzip")
+                                 dtype='f4', chunks=(chunk_size_time, self.total_nodes))
         
         # Static Node Mapping (Topological indices)
         self.file.create_dataset(self.DS_NODE_MAP_LAYER, shape=(self.total_nodes,), dtype='i4')
