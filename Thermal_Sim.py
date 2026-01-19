@@ -27,13 +27,13 @@ LOGGING_EVERY_N_STEPS = max(1, int(LOGGING_FREQUENCY / DT))  # Log data every N 
 # N_LAYERS_WITH_ELEMENTS: Top layers where beads are further subdivided (finer resolution)
 # N_ELEMENTS_PER_BEAD: Subdivision count per bead (only used if N_LAYERS_WITH_ELEMENTS > 0)
 # Currently the simulation uses N_LAYERS_AS_BEADS = 2 (current + previous layer as beads)
-# Element-level refinement is prepared but not yet fully implemented
+# Element-level refinement is still sometimes unstable if to manny elements are used and DT is too high.
 N_LAYERS_AS_BEADS = 4       # Number of top layers modeled as individual beads (default: 2)
 N_LAYERS_WITH_ELEMENTS = 2  # Number of top layers where beads are subdivided into elements (0 = disabled)
 N_ELEMENTS_PER_BEAD = 5     # Number of elements per bead along track length (if enabled)
 
 # --- WAAM Process Parameters ---
-NUMBER_OF_LAYERS = 15        # Total number of layers to be deposited (Reccomended to use +1 Layer for better results)
+NUMBER_OF_LAYERS = 14        # Total number of layers to be deposited (Reccomended to use +1 Layer for better results)
 LAYER_HEIGHT = 0.0032       # [m] (e.g., 2.4mm)
 
 # Track geometry
@@ -1573,7 +1573,7 @@ def run_simulation():
     print(f"Layer geometry: {effective_layer_width*1000:.1f}mm x {TRACK_LENGTH*1000:.1f}mm x {LAYER_HEIGHT*1000:.1f}mm")
     print(f"Layer duration: {layer_duration:.1f}s ({NUMBER_OF_TRACKS} tracks at {PROCESS_SPEED*1000:.1f}mm/s)")
     print(f"Total height after {NUMBER_OF_LAYERS} layers: {NUMBER_OF_LAYERS * LAYER_HEIGHT*1000:.1f}mm")
-    print(f"Discretization: {N_LAYERS_AS_BEADS} top layers as beads, {N_LAYERS_WITH_ELEMENTS} with elements ({N_ELEMENTS_PER_BEAD}/bead)")
+    print(f"Discretization: {N_LAYERS_AS_BEADS} top layers as beads, {N_LAYERS_WITH_ELEMENTS} with elements ({N_ELEMENTS_PER_BEAD}/bead => {element_length*1000:.1f}mm each)")
     print(f"Table discretization: {table_info_str}")
     print(f"Max stable DT: {dt_max_stable:.4f} s (using {dt_sim:.4f} s)")
     print(f"Arc Power: Total = {ARC_POWER:.1f} W, Wire Melting = {power_wire_melting:.1f} W, Effective = {effective_arc_power:.1f} W")
@@ -1916,6 +1916,107 @@ def main():
         print(f"Formula: Wait time = a + b * ln(i+1)")
         print(f" >> a: {a_opt:{fmt}} s")
         print(f" >> b: {b_opt:{fmt}} s/log(Layer)")
+    
+    # Calculate and print fit errors
+    y_fitted = fit_func(x_vals, *popt)
+    residuals = y_vals - y_fitted
+    
+    idx_max_pos = np.argmax(residuals)
+    max_pos_error = residuals[idx_max_pos]
+    
+    idx_max_neg = np.argmin(residuals)
+    max_neg_error = residuals[idx_max_neg]
+
+    def get_temp_at_end_of_wait(layer_idx, residual, t_data, layers_data):
+        """
+        Estimates the temperature of layer_idx at the fitted wait time.
+        t_actual_end = t_data where waiting phase ended.
+        t_fitted_end = t_actual_end - residual.
+        """
+        # 1. Find the simulation step where the layer wait ended.
+        # This corresponds to the transition where len(layers_data) increases from layer_idx+1 to layer_idx+2.
+        target_len = layer_idx + 2
+        
+        end_idx = -1
+        # Scan layers_data to find the transition (next layer starts)
+        for k, frame in enumerate(layers_data):
+            if len(frame) >= target_len:
+                end_idx = k
+                break
+        
+        # If next layer never started (e.g. last layer), use the end of simulation
+        if end_idx == -1:
+            end_idx = len(layers_data)
+        
+        # The frame just BEFORE the new layer appears is the end of the wait
+        tick_idx = max(0, end_idx - 1)
+        
+        if tick_idx >= len(t_data):
+             return np.nan
+
+        t_actual_end = t_data[tick_idx]
+        try:
+            # Get temp of the specific layer we are interested in (the one we waited for)
+            T_actual = layers_data[tick_idx][layer_idx]
+        except (IndexError, TypeError):
+            return np.nan
+
+        # 2. Calculate target time based on residual
+        # Residual = Actual - Fitted  =>  Fitted = Actual - Residual
+        t_target = t_actual_end - residual
+        
+        # 3. Find Temperature at t_target
+        if t_target <= t_actual_end:
+            # Interpolate backwards using t_data
+            # Find closest index (simple linear scan backwards is fast enough here)
+            curr = tick_idx
+            while curr > 0 and t_data[curr] > t_target:
+                curr -= 1
+            
+            # Simple linear interpolation
+            t1 = t_data[curr]
+            t2 = t_data[curr+1] if curr+1 < len(t_data) else t1
+            
+            if abs(t2 - t1) < 1e-9: return layers_data[curr][layer_idx]
+            
+            v1 = layers_data[curr][layer_idx]
+            v2 = layers_data[curr+1][layer_idx] if curr+1 < len(layers_data) else v1
+            
+            fraction = (t_target - t1) / (t2 - t1)
+            return v1 + fraction * (v2 - v1)
+            
+        else:
+            # Extrapolate forward
+            # Calculate cooling rate (slope) from last few seconds
+            lookback = 0
+            while lookback < 20 and tick_idx - lookback > 0:
+                if t_actual_end - t_data[tick_idx - lookback] > 2.0: # look back ~2 seconds
+                    break
+                lookback += 1
+            
+            p1 = tick_idx - lookback
+            p2 = tick_idx
+            
+            if p1 == p2: return T_actual
+            
+            t_start, t_end_pt = t_data[p1], t_data[p2]
+            v_start, v_end_pt = layers_data[p1][layer_idx], layers_data[p2][layer_idx]
+            
+            if abs(t_end_pt - t_start) < 1e-6: return v_end_pt
+            
+            slope = (v_end_pt - v_start) / (t_end_pt - t_start)
+            dt = t_target - t_actual_end
+            return v_end_pt + slope * dt
+
+    temp_pos_err = get_temp_at_end_of_wait(idx_max_pos, max_pos_error, t_data, layers_data)
+    temp_neg_err = get_temp_at_end_of_wait(idx_max_neg, max_neg_error, t_data, layers_data)
+
+    print("-" * 20)
+    print("FIT ERRORS (Actual - Fitted):")
+    print(f" >> Max Positive Error (Curve below actual): +{max_pos_error:{fmt}} s on Layer {idx_max_pos+1}")
+    print(f"    >> Resulting in an end of Waiting Time Temperature of approx. {temp_pos_err:.1f} °C")
+    print(f" >> Max Negative Error (Curve above actual): {max_neg_error:{fmt}} s on Layer {idx_max_neg+1}")
+    print(f"    >> Resulting in an end of Waiting Time Temperature of approx. {temp_neg_err:.1f} °C")
     print("="*40)
 
     # --- Plots ---
