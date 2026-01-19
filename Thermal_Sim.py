@@ -5,6 +5,7 @@ from tqdm import tqdm
 from scipy.optimize import curve_fit
 from scipy.integrate import quad
 from numba import jit
+import itertools
 from Material_Properties import get_material
 from async_state_manager import (
     create_state_manager,
@@ -55,6 +56,7 @@ WIRE_DIAMETER = 0.0012      # [m] Wire diameter (e.g., 1.2mm)
 # Or cubic: Robot_Wait = a + b*i + c*i^2 + d*i^3
 # Or log: Robot_Wait = a + b * ln(i+1)
 ROBOT_FIT_MODE = "cubic"  # "linear", "cubic" or "log"
+FIT_DECIMALS = 2          # Number of decimal places for fit parameters (e.g., 2). Set None to disable rounding.
 
 # --- Geometry & Material: WAAM Wire ---
 MATERIAL_WAAM_NAME = "S235JR"
@@ -1819,32 +1821,68 @@ def main():
     
     # --- Calculation of robot factor ---
     # We have the list 'waits'. We fit a function based on ROBOT_FIT_MODE
-    # x-values are the layer indices [0, 1, 2, ...]
-    x_vals = np.arange(len(waits))
+    # x-values are the layer indices [1, 2, 3, ...] (1-based for formula consistency)
+    x_vals = np.arange(len(waits)) + 1
     y_vals = np.array(waits)
+
+    def optimize_rounded(func, x, y, initial_popt, decimals):
+        """Find best parameters rounded to specific decimals around the initial guess."""
+        best_p = tuple(round(p, decimals) for p in initial_popt) # Default to just rounding the initial guess
+        min_loss = np.sum((y - func(x, *best_p))**2)
+        
+        ranges = []
+        for p in initial_popt:
+            # Check floor and ceil at the given decimal precision
+            val_floor = np.floor(p * 10**decimals) / 10**decimals
+            val_ceil = np.ceil(p * 10**decimals) / 10**decimals
+            # Create candidates (unique values)
+            candidates = sorted(list(set([val_floor, val_ceil])))
+            ranges.append(candidates)
+        
+        # Brute force search in the small neighborhood
+        for params in itertools.product(*ranges):
+            loss = np.sum((y - func(x, *params))**2)
+            if loss < min_loss:
+                min_loss = loss
+                best_p = params
+        return best_p
     
     if ROBOT_FIT_MODE == "linear":
         # Fit linear: y = base_time + i * factor
         # Constraint: base_time (a) >= 0
         popt, _ = curve_fit(linear_func, x_vals, y_vals, bounds=([0, -np.inf], [np.inf, np.inf]))
+        
+        if FIT_DECIMALS is not None:
+             popt = optimize_rounded(linear_func, x_vals, y_vals, popt, FIT_DECIMALS)
+
         base_time_opt = popt[0]
         factor_opt = popt[1]
         fit_func = linear_func
-        fit_label = f'Robot Fit: {base_time_opt:.1f} + i*{factor_opt:.2f}'
+        fit_label = f'Robot Fit: {base_time_opt:.{FIT_DECIMALS}f} + i*{factor_opt:.{FIT_DECIMALS}f}' if FIT_DECIMALS else f'Robot Fit: {base_time_opt:.1f} + i*{factor_opt:.2f}'
+
     elif ROBOT_FIT_MODE == "cubic":
         # Fit cubic: y = a + b*i + c*i^2 + d*i^3
         # Constraint: constant term (a) >= 0
         popt, _ = curve_fit(cubic_func, x_vals, y_vals, bounds=([0, -np.inf, -np.inf, -np.inf], [np.inf, np.inf, np.inf, np.inf]))
+
+        if FIT_DECIMALS is not None:
+             popt = optimize_rounded(cubic_func, x_vals, y_vals, popt, FIT_DECIMALS)
+
         a_opt, b_opt, c_opt, d_opt = popt
         fit_func = cubic_func
-        fit_label = f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*i + {c_opt:.3f}*i² + {d_opt:.4f}*i³'
+        fit_label = f'Robot Fit: {a_opt:.{FIT_DECIMALS}f} + {b_opt:.{FIT_DECIMALS}f}*i + {c_opt:.{FIT_DECIMALS}f}*i² + {d_opt:.{FIT_DECIMALS}f}*i³' if FIT_DECIMALS else f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*i + {c_opt:.3f}*i² + {d_opt:.4f}*i³'
+
     elif ROBOT_FIT_MODE == "log":
         # Fit logarithmic: y = a + b * ln(i + 1)
         # Constraint: constant term (a) >= 0
         popt, _ = curve_fit(log_func, x_vals, y_vals, bounds=([0, -np.inf], [np.inf, np.inf]))
+
+        if FIT_DECIMALS is not None:
+             popt = optimize_rounded(log_func, x_vals, y_vals, popt, FIT_DECIMALS)
+
         a_opt, b_opt = popt
         fit_func = log_func
-        fit_label = f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*ln(i+1)'
+        fit_label = f'Robot Fit: {a_opt:.{FIT_DECIMALS}f} + {b_opt:.{FIT_DECIMALS}f}*ln(i+1)' if FIT_DECIMALS else f'Robot Fit: {a_opt:.1f} + {b_opt:.2f}*ln(i+1)'
     else:
         raise ValueError("Invalid ROBOT_FIT_MODE. Choose 'linear', 'cubic' or 'log'.")
     
@@ -1857,24 +1895,27 @@ def main():
     for i, w in enumerate(waits):
         print(f"  Layer {i+1} -> Wait time: {w:.2f} s")
     
+    
+    fmt = f".{FIT_DECIMALS}f" if FIT_DECIMALS is not None else ".4f"
+    
     print("-" * 20)
     if ROBOT_FIT_MODE == "linear":
         print("ROBOT PARAMETERS (Linear Approximation):")
         print(f"Formula: Wait time = Base time + (i * Factor)")
-        print(f" >> Base time: {base_time_opt:.4f} s")
-        print(f" >> Factor:    {factor_opt:.4f} s/Layer")
+        print(f" >> Base time: {base_time_opt:{fmt}} s")
+        print(f" >> Factor:    {factor_opt:{fmt}} s/Layer")
     elif ROBOT_FIT_MODE == "cubic":
         print("ROBOT PARAMETERS (Cubic Approximation):")
         print(f"Formula: Wait time = a + b*i + c*i² + d*i³")
-        print(f" >> a: {a_opt:.4f} s")
-        print(f" >> b: {b_opt:.4f} s/Layer")
-        print(f" >> c: {c_opt:.6f} s/Layer²")
-        print(f" >> d: {d_opt:.8f} s/Layer³")
+        print(f" >> a: {a_opt:{fmt}} s")
+        print(f" >> b: {b_opt:{fmt}} s/Layer")
+        print(f" >> c: {c_opt:{fmt}} s/Layer²")
+        print(f" >> d: {d_opt:{fmt}} s/Layer³")
     elif ROBOT_FIT_MODE == "log":
         print("ROBOT PARAMETERS (Logarithmic Approximation):")
         print(f"Formula: Wait time = a + b * ln(i+1)")
-        print(f" >> a: {a_opt:.4f} s")
-        print(f" >> b: {b_opt:.4f} s/log(Layer)")
+        print(f" >> a: {a_opt:{fmt}} s")
+        print(f" >> b: {b_opt:{fmt}} s/log(Layer)")
     print("="*40)
 
     # --- Plots ---
@@ -1912,8 +1953,9 @@ def main():
     
     # Plot 2: Wait times & Fit
     plt.subplot(2, 1, 2)
-    plt.scatter(x_vals + 1, y_vals, color='black', label='Simulated wait times')
-    plt.plot(x_vals + 1, fit_func(x_vals, *popt), color='red', linestyle='--', 
+    # x_vals are already 1-based indices [1, 2, 3...]
+    plt.scatter(x_vals, y_vals, color='black', label='Simulated wait times')
+    plt.plot(x_vals, fit_func(x_vals, *popt), color='red', linestyle='--', 
              label=fit_label)
     plt.title(f'Wait time per layer ({ROBOT_FIT_MODE.capitalize()} fit)')
     plt.ylabel('Wait time [s]')
