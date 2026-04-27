@@ -40,6 +40,38 @@ DEFAULTS = {
     'BP_THICKNESS': 0.01,
 }
 
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Default HDF5 state file to visualize.
+H5_FILE_NAME = 'simulation_state.h5'
+
+# Maximum number of animation timesteps shown in Plotly.
+# Set to 0 or a negative value to show every logged timestep.
+MAX_DISPLAYED_TIMESTEPS = 150
+
+# Temperature color scale appearance.
+TEMP_SCALE_LENGTH = 0.95
+TEMP_SCALE_THICKNESS = 38
+TEMP_SCALE_TITLE_FONT_SIZE = 30
+TEMP_SCALE_TICK_FONT_SIZE = 23
+TEMP_SCALE_COLORSCALE = 'Viridis'  # Can be any Plotly colorscale
+
+# Plot layout and text sizing.
+AXIS_TITLE_FONT_SIZE = 24
+AXIS_TICK_FONT_SIZE = 18
+PLOT_MARGIN_LEFT = 8
+PLOT_MARGIN_RIGHT = 8
+PLOT_MARGIN_TOP = 70
+PLOT_MARGIN_BOTTOM = 50
+
+# UI element placement.
+PLAY_BUTTON_X = 0.02
+PLAY_BUTTON_Y = 1.07
+SLIDER_X = 0.16
+SLIDER_LENGTH = 0.80
+
 class SimulationDataLoader:
     def __init__(self, filepath):
         self.filepath = filepath
@@ -86,6 +118,23 @@ class SimulationDataLoader:
             self.waam_start_idx = waam_indices[0]
         else:
             self.waam_start_idx = self.total_nodes 
+
+        # Table nodes are stored before the base plate, which is directly before WAAM nodes.
+        self.table_end_idx = max(0, self.waam_start_idx - 1)
+        self.table_node_indices = np.arange(self.table_end_idx, dtype=np.int32)
+        if len(self.table_node_indices) > 0:
+            table_bead_codes = self.map_bead[self.table_node_indices]
+            table_element_codes = self.map_element[self.table_node_indices]
+            table_ix = table_bead_codes // 100
+            table_iy = table_bead_codes % 100
+            table_iz = table_element_codes
+            self.table_grid_shape = (
+                int(np.max(table_ix)) + 1,
+                int(np.max(table_iy)) + 1,
+                int(np.max(table_iz)) + 1,
+            )
+        else:
+            self.table_grid_shape = (1, 1, 1)
             
         print(f"File loaded: {self.num_steps} steps, {self.total_nodes} nodes.")
 
@@ -124,6 +173,17 @@ class SimulationDataLoader:
         bp_thick = self.params.get('BP_THICKNESS', DEFAULTS['BP_THICKNESS'])
         bp_len = self.params.get('BP_LENGTH', DEFAULTS['BP_LENGTH'])
         bp_wid = self.params.get('BP_WIDTH', DEFAULTS['BP_WIDTH'])
+        table_len = self.params.get('TABLE_LENGTH', 2.0)
+        table_wid = self.params.get('TABLE_WIDTH', 1.2)
+        table_thick = self.params.get('TABLE_THICKNESS', 0.01)
+        table_nx, table_ny, table_nz = self.table_grid_shape
+        table_dx = table_len / table_nx
+        table_dy = table_wid / table_ny
+        table_dz = table_thick / table_nz
+        table_contact_x = 0.5 * table_dx
+        table_contact_y = 0.5 * table_dy
+        waam_x_offset = table_contact_x - (tl / 2.0)
+        waam_y_offset = table_contact_y - layer_center_y
         
         node_names = []
 
@@ -133,14 +193,20 @@ class SimulationDataLoader:
             # --- NON-WAAM NODES (Table/BP) ---
             if idx < self.waam_start_idx:
                 if idx == self.waam_start_idx - 1: # BP
-                    centers[i] = [tl/2, layer_center_y, -bp_thick/2]
+                    centers[i] = [table_contact_x, table_contact_y, bp_thick/2]
                     sizes[i] = [bp_len, bp_wid, bp_thick]
                     node_names.append(f"Base Plate (Node {idx})")
                 else: # Table (Simplified)
-                    # Distribute table nodes slightly to verify they are not all just one
-                    # Simple grid attempt? No, just stack them slightly offset or same place
-                    centers[i] = [tl/2, layer_center_y, -0.02 - bp_thick - (idx * 0.001)] 
-                    sizes[i] = [0.5, 0.5, 0.02]
+                    ix = int(self.map_bead[idx]) // 100
+                    iy = int(self.map_bead[idx]) % 100
+                    iz = int(self.map_element[idx])
+
+                    centers[i] = [
+                        (ix + 0.5) * table_dx,
+                        (iy + 0.5) * table_dy,
+                        -((table_nz - iz - 0.5) * table_dz),
+                    ]
+                    sizes[i] = [table_dx, table_dy, table_dz]
                     node_names.append(f"Table Node {idx}")
                 continue
             
@@ -149,20 +215,20 @@ class SimulationDataLoader:
             B = self.map_bead[idx]
             E = self.map_element[idx]
             
-            cz = L * lh + lh/2
+            cz = bp_thick + L * lh + lh/2
             
             if l_val == 1: # TYPE_LAYER
-                centers[i] = [tl/2, layer_center_y, cz]
+                centers[i] = [waam_x_offset + tl/2, waam_y_offset + layer_center_y, cz]
                 sizes[i] = [tl, layer_width, lh]
                 node_names.append(f"Layer {L} (Node {idx})")
                 
             elif l_val == 2: # TYPE_BEAD
-                centers[i] = [tl/2, B * pitch, cz]
+                centers[i] = [waam_x_offset + tl/2, waam_y_offset + B * pitch, cz]
                 sizes[i] = [tl, tw, lh]
                 node_names.append(f"L{L} Bead {B} (Node {idx})")
                 
             elif l_val == 3: # TYPE_ELEMENT
-                centers[i] = [E * elem_len + elem_len/2, B * pitch, cz]
+                centers[i] = [waam_x_offset + E * elem_len + elem_len/2, waam_y_offset + B * pitch, cz]
                 sizes[i] = [elem_len, tw, lh]
                 node_names.append(f"L{L} B{B} E{E} (Node {idx})")
             else:
@@ -200,9 +266,14 @@ def visualize_matplotlib(loader):
     # No, let's try to make it right.
     # For performance, we stick to Scatter in Matplotlib but show a warning that Plotly is better.
     
-    scat = ax.scatter(centers[:,0], centers[:,1], centers[:,2], c=temps, cmap='hot', marker='s', s=50)
-    cb = plt.colorbar(scat)
-    cb.set_label('Temperature [°C]')
+    scat = ax.scatter(
+        centers[:,0], centers[:,1], centers[:,2],
+        c=temps, cmap=TEMP_SCALE_COLORSCALE, marker='s', s=60,
+        edgecolors='black', linewidths=0.35
+    )
+    cb = plt.colorbar(scat, fraction=0.07, pad=0.04)
+    cb.set_label('Temperature [°C]', fontsize=14)
+    cb.ax.tick_params(labelsize=12)
     
     title = ax.set_title(f"Time: {time:.2f} s")
     ax.set_xlabel('X [m]')
@@ -238,7 +309,7 @@ def visualize_matplotlib(loader):
             
         scat._offsets3d = (c[:,0], c[:,1], c[:,2])
         scat.set_array(t)
-        scat.set_clim(vpn=t.min(), vmax=t.max())
+        scat.set_clim(vmin=t.min(), vmax=t.max())
         
         title.set_text(f"Time: {time_val:.2f} s")
         slider.valtext.set_text(f"{time_val:.1f} s")
@@ -325,6 +396,43 @@ def generate_mesh_data(centers, sizes, temps):
     
     return x, y, z, II, JJ, KK, intensities
 
+
+def generate_edge_data(centers, sizes):
+    """Generate line segments for cube edges."""
+    edge_x = []
+    edge_y = []
+    edge_z = []
+
+    # Only draw the faces that are visible from the default camera direction.
+    face_edges = [
+        [(1, 2), (2, 6), (6, 5), (5, 1)],
+        [(2, 3), (3, 7), (7, 6), (6, 2)],
+        [(4, 5), (5, 6), (6, 7), (7, 4)],
+    ]
+
+    for center, size in zip(centers, sizes):
+        x0, y0, z0 = center - size / 2.0
+        x1, y1, z1 = center + size / 2.0
+
+        corners = np.array([
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ])
+
+        for edges in face_edges:
+            for a, b in edges:
+                edge_x.extend([corners[a, 0], corners[b, 0], None])
+                edge_y.extend([corners[a, 1], corners[b, 1], None])
+                edge_z.extend([corners[a, 2], corners[b, 2], None])
+
+    return edge_x, edge_y, edge_z
+
 def visualize_plotly(loader):
     """Interactive Plotly Visualization with Scaled Blocks."""
     print("Preparing Plotly visualization...")
@@ -338,6 +446,7 @@ def visualize_plotly(loader):
     
     # Generate Mesh
     x, y, z, i, j, k, intensity = generate_mesh_data(centers, sizes, temps)
+    edge_x, edge_y, edge_z = generate_edge_data(centers, sizes)
     
     # Base Trace
     trace = go.Mesh3d(
@@ -346,29 +455,62 @@ def visualize_plotly(loader):
         intensity=intensity,
         text=np.repeat([f"{Name}<br>Temp: {T:.1f} °C" for Name, T in zip(node_names, temps)], 8),
         hoverinfo='text',
-        colorscale='Hot',
-        colorbar=dict(title='Temp [°C]'),
+        colorscale=TEMP_SCALE_COLORSCALE,
+        colorbar=dict(
+            title=dict(text='Temp [°C]', font=dict(size=TEMP_SCALE_TITLE_FONT_SIZE)),
+            tickfont=dict(size=TEMP_SCALE_TICK_FONT_SIZE),
+            len=TEMP_SCALE_LENGTH,
+            thickness=TEMP_SCALE_THICKNESS,
+            x=1.01,
+            xanchor='left',
+        ),
         name='Nodes',
         showscale=True,
-        flatshading=True 
+        flatshading=True,
+        opacity=0.95
+    )
+
+    edge_trace = go.Scatter3d(
+        x=edge_x, y=edge_y, z=edge_z,
+        mode='lines',
+        line=dict(color='rgba(20,20,20,0.7)', width=2),
+        hoverinfo='skip',
+        showlegend=False,
+        name='Edges'
     )
     
     # Layout
     layout = go.Layout(
         title=f"Time: {time:.2f} s",
         scene=dict(
-            xaxis_title='X [m]',
-            yaxis_title='Y [m]',
-            zaxis_title='Z [m]',
-            aspectmode='data'  # Crucial for correct proportions
+            xaxis=dict(
+                title=dict(text='X [m]', font=dict(size=AXIS_TITLE_FONT_SIZE)),
+                tickfont=dict(size=AXIS_TICK_FONT_SIZE)
+            ),
+            yaxis=dict(
+                title=dict(text='Y [m]', font=dict(size=AXIS_TITLE_FONT_SIZE)),
+                tickfont=dict(size=AXIS_TICK_FONT_SIZE)
+            ),
+            zaxis=dict(
+                title=dict(text='Z [m]', font=dict(size=AXIS_TITLE_FONT_SIZE)),
+                tickfont=dict(size=AXIS_TICK_FONT_SIZE)
+            ),
+            aspectmode='data',  # Crucial for correct proportions
+            camera=dict(eye=dict(x=1.6, y=1.2, z=0.9))
         ),
         updatemenus=[dict(
             type="buttons",
+            x=PLAY_BUTTON_X,
+            y=PLAY_BUTTON_Y,
+            xanchor='left',
+            yanchor='bottom',
+            pad=dict(t=0, r=0),
             buttons=[dict(label="Play",
                           method="animate",
                           args=[None, dict(frame=dict(duration=100, redraw=True), 
                                            fromcurrent=True)])]
-        )]
+        )],
+        margin=dict(l=PLOT_MARGIN_LEFT, r=PLOT_MARGIN_RIGHT, t=PLOT_MARGIN_TOP, b=PLOT_MARGIN_BOTTOM)
     )
     
     # Frames
@@ -378,36 +520,51 @@ def visualize_plotly(loader):
     # Current stride calculates "50 frames total", which might be too coarse or fine.
     # Let's set stride=1 if user wants full resolution, or auto-downsample only if massive.
     
-    # Using stride=1 (every logged step)
-    stride = 1 
-    if loader.num_steps > 300:
-        stride = loader.num_steps // 100 # Limit to ~100 frames for performance if huge
+    if MAX_DISPLAYED_TIMESTEPS and MAX_DISPLAYED_TIMESTEPS > 0:
+        stride = max(1, loader.num_steps // MAX_DISPLAYED_TIMESTEPS)
+    else:
+        stride = 1
     
     print(f"Generating animation frames (Stride={stride})...")
     for step_idx in range(0, loader.num_steps, stride):
         c, s, t, ty, tm, idxs, names = loader.get_step_data(step_idx)
         mx, my, mz, mi, mj, mk, mint = generate_mesh_data(c, s, t)
+        ex, ey, ez = generate_edge_data(c, s)
         
         # Build hover text for this frame
         # We need to repeat the text 8 times (once per vertex)
         frame_text = np.repeat([f"{Name}<br>Temp: {T:.1f} °C" for Name, T in zip(names, t)], 8)
 
         frames.append(go.Frame(
-            data=[go.Mesh3d(
-                x=mx, y=my, z=mz,
-                i=mi, j=mj, k=mk,
-                intensity=mint,
-                text=frame_text,
-                hoverinfo='text'
-            )],
+            data=[
+                go.Mesh3d(
+                    x=mx, y=my, z=mz,
+                    i=mi, j=mj, k=mk,
+                    intensity=mint,
+                    text=frame_text,
+                    hoverinfo='text',
+                    colorscale=TEMP_SCALE_COLORSCALE,
+                    flatshading=True,
+                    opacity=1.0
+                ),
+                go.Scatter3d(
+                    x=ex, y=ey, z=ez,
+                    mode='lines',
+                    line=dict(color='rgba(20,20,20,0.8)', width=2),
+                    hoverinfo='skip',
+                    showlegend=False
+                )
+            ],
             name=str(step_idx),
             layout=go.Layout(title=f"Time: {tm:.2f} s")
         ))
 
-    fig = go.Figure(data=[trace], layout=layout, frames=frames)
+    fig = go.Figure(data=[trace, edge_trace], layout=layout, frames=frames)
     
     # Slider with time labels
     sliders = [dict(
+        x=SLIDER_X,
+        len=SLIDER_LENGTH,
         steps=[dict(
             method= 'animate',
             args= [[str(k)], dict(mode='immediate', frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
@@ -423,7 +580,7 @@ def visualize_plotly(loader):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize WAAM Thermal Simulation HDF5")
-    parser.add_argument('file', nargs='?', default='simulation_state.h5', help='HDF5 State File')
+    parser.add_argument('file', nargs='?', default=H5_FILE_NAME, help='HDF5 State File')
     parser.add_argument('--backend', choices=['matplotlib', 'plotly'], default='plotly' if HAS_PLOTLY else 'matplotlib')
     
     args = parser.parse_args()
